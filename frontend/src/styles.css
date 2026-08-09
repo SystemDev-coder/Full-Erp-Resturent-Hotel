@@ -1,0 +1,7 @@
+body{font-family:Inter,system-ui,Arial;margin:0}
+.app{display:flex;min-height:100vh}
+.sidebar{width:220px;background:#0f172a;color:#fff;padding:20px}
+.sidebar a{display:block;color:#cbd5e1;margin:8px 0;text-decoration:none}
+.main{flex:1;padding:24px}
+.card{background:#fff;padding:16px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.1)}
+.form-row{margin-bottom:12px}
