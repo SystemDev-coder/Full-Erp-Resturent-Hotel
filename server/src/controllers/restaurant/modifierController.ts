@@ -1,6 +1,21 @@
 import { Request, Response } from 'express'
 import { query } from '../../db/pool'
 
+// Ownership checks: every id in the URL must belong to the caller's branch.
+const groupInBranch = async (groupId: string, branchId: string) =>
+  !!(await query(
+    `SELECT 1 FROM modifier_group mg JOIN restaurant r ON r.id = mg.restaurant_id
+     WHERE mg.id = $1 AND r.branch_id = $2 AND mg.deleted_at IS NULL`, [groupId, branchId])).rows[0]
+
+const itemInBranch = async (itemId: string, branchId: string) =>
+  !!(await query(
+    `SELECT 1 FROM menu_item mi JOIN menu_category mc ON mc.id = mi.category_id
+     JOIN restaurant r ON r.id = mc.restaurant_id
+     WHERE mi.id = $1 AND r.branch_id = $2 AND mi.deleted_at IS NULL`, [itemId, branchId])).rows[0]
+
+const notFound = (res: Response, what: string) =>
+  res.status(404).json({ success: false, message: `${what} not found` })
+
 // ── Modifier Groups ───────────────────────────────────────────────────────────
 
 export async function listModifierGroups(req: Request, res: Response) {
@@ -53,18 +68,24 @@ export async function updateModifierGroup(req: Request, res: Response) {
        min_selections  = COALESCE($4, min_selections),
        max_selections  = COALESCE($5, max_selections),
        display_order   = COALESCE($6, display_order)
-     WHERE id = $7 AND deleted_at IS NULL RETURNING id, name`,
+     WHERE id = $7 AND deleted_at IS NULL
+       AND restaurant_id IN (SELECT id FROM restaurant WHERE branch_id = $8)
+     RETURNING id, name`,
     [name ?? null, selection_type ?? null, is_required ?? null,
-     min_selections ?? null, max_selections ?? null, display_order ?? null, id]
+     min_selections ?? null, max_selections ?? null, display_order ?? null, id, req.auth!.branchId]
   )
   if (!rows[0]) return res.status(404).json({ success: false, message: 'Modifier group not found' })
   return res.json({ success: true, data: rows[0] })
 }
 
 export async function deleteModifierGroup(req: Request, res: Response) {
-  await query(
-    `UPDATE modifier_group SET deleted_at = NOW() WHERE id = $1`, [req.params.id]
+  const { rows } = await query(
+    `UPDATE modifier_group SET deleted_at = NOW()
+     WHERE id = $1 AND deleted_at IS NULL AND restaurant_id IN (SELECT id FROM restaurant WHERE branch_id = $2)
+     RETURNING id`,
+    [req.params.id, req.auth!.branchId]
   )
+  if (!rows[0]) return notFound(res, 'Modifier group')
   return res.json({ success: true })
 }
 
@@ -74,6 +95,10 @@ export async function addModifier(req: Request, res: Response) {
   const { group_id } = req.params
   const { name, price_delta = 0, display_order = 0 } = req.body
   if (!name) return res.status(400).json({ success: false, message: 'name is required' })
+  if (!Number.isFinite(Number(price_delta)) || Number(price_delta) < 0) {
+    return res.status(400).json({ success: false, message: 'price_delta cannot be negative' })
+  }
+  if (!(await groupInBranch(group_id, req.auth!.branchId))) return notFound(res, 'Modifier group')
 
   const { rows } = await query(
     `INSERT INTO menu_modifier (group_id, name, price_delta, display_order)
@@ -92,15 +117,24 @@ export async function updateModifier(req: Request, res: Response) {
        price_delta   = COALESCE($2, price_delta),
        is_available  = COALESCE($3, is_available),
        display_order = COALESCE($4, display_order)
-     WHERE id = $5 AND deleted_at IS NULL RETURNING id, name, price_delta`,
-    [name ?? null, price_delta ?? null, is_available ?? null, display_order ?? null, id]
+     WHERE id = $5 AND deleted_at IS NULL
+       AND group_id IN (SELECT mg.id FROM modifier_group mg JOIN restaurant r ON r.id = mg.restaurant_id WHERE r.branch_id = $6)
+     RETURNING id, name, price_delta`,
+    [name ?? null, price_delta ?? null, is_available ?? null, display_order ?? null, id, req.auth!.branchId]
   )
   if (!rows[0]) return res.status(404).json({ success: false, message: 'Modifier not found' })
   return res.json({ success: true, data: rows[0] })
 }
 
 export async function deleteModifier(req: Request, res: Response) {
-  await query(`UPDATE menu_modifier SET deleted_at = NOW() WHERE id = $1`, [req.params.id])
+  const { rows } = await query(
+    `UPDATE menu_modifier SET deleted_at = NOW()
+     WHERE id = $1 AND deleted_at IS NULL
+       AND group_id IN (SELECT mg.id FROM modifier_group mg JOIN restaurant r ON r.id = mg.restaurant_id WHERE r.branch_id = $2)
+     RETURNING id`,
+    [req.params.id, req.auth!.branchId]
+  )
+  if (!rows[0]) return notFound(res, 'Modifier')
   return res.json({ success: true })
 }
 
@@ -108,15 +142,20 @@ export async function deleteModifier(req: Request, res: Response) {
 
 export async function linkModifierGroup(req: Request, res: Response) {
   const { itemId, groupId } = req.params
+  const { branchId } = req.auth!
+  if (!(await itemInBranch(itemId, branchId))) return notFound(res, 'Menu item')
+  if (!(await groupInBranch(groupId, branchId))) return notFound(res, 'Modifier group')
+  // DO UPDATE (not DO NOTHING): re-linking a group that was unlinked earlier must bring it back
   await query(
     `INSERT INTO menu_item_modifier_group (menu_item_id, group_id)
-     VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+     VALUES ($1,$2) ON CONFLICT (menu_item_id, group_id) DO UPDATE SET deleted_at = NULL, deleted_by = NULL`,
     [itemId, groupId]
   )
   return res.json({ success: true })
 }
 
 export async function unlinkModifierGroup(req: Request, res: Response) {
+  if (!(await itemInBranch(req.params.itemId, req.auth!.branchId))) return notFound(res, 'Menu item')
   await query(
     `UPDATE menu_item_modifier_group SET deleted_at = NOW()
      WHERE menu_item_id = $1 AND group_id = $2`,
@@ -128,6 +167,7 @@ export async function unlinkModifierGroup(req: Request, res: Response) {
 // ── Recipe ────────────────────────────────────────────────────────────────────
 
 export async function getRecipe(req: Request, res: Response) {
+  if (!(await itemInBranch(req.params.menuItemId, req.auth!.branchId))) return notFound(res, 'Menu item')
   const { rows } = await query(
     `SELECT r.id, r.item_id, r.quantity_used, r.unit,
             i.name AS ingredient_name, i.unit_of_measure
@@ -144,6 +184,10 @@ export async function upsertRecipeLine(req: Request, res: Response) {
   if (!item_id || !quantity_used || !unit) {
     return res.status(400).json({ success: false, message: 'item_id, quantity_used, unit are required' })
   }
+  if (!Number.isFinite(Number(quantity_used)) || Number(quantity_used) <= 0) {
+    return res.status(400).json({ success: false, message: 'quantity_used must be greater than 0' })
+  }
+  if (!(await itemInBranch(menuItemId, req.auth!.branchId))) return notFound(res, 'Menu item')
   const { rows } = await query(
     `INSERT INTO recipe (menu_item_id, item_id, quantity_used, unit)
      VALUES ($1,$2,$3,$4)
@@ -156,20 +200,49 @@ export async function upsertRecipeLine(req: Request, res: Response) {
 }
 
 export async function deleteRecipeLine(req: Request, res: Response) {
-  await query(`UPDATE recipe SET deleted_at = NOW() WHERE id = $1`, [req.params.id])
+  const { rows } = await query(
+    `UPDATE recipe SET deleted_at = NOW()
+     WHERE id = $1 AND deleted_at IS NULL
+       AND menu_item_id IN (SELECT mi.id FROM menu_item mi JOIN menu_category mc ON mc.id = mi.category_id
+                            JOIN restaurant r ON r.id = mc.restaurant_id WHERE r.branch_id = $2)
+     RETURNING id`,
+    [req.params.id, req.auth!.branchId]
+  )
+  if (!rows[0]) return notFound(res, 'Recipe line')
   return res.json({ success: true })
 }
 
 // ── Public menu (for QR code page) ───────────────────────────────────────────
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+// Public (no login): the live menu behind a table's QR code.
 export async function getPublicMenu(req: Request, res: Response) {
-  const { branchId } = req.params
+  let branchId = req.params.branchId
+
+  // QR codes printed before branches were part of the link looked like /menu/<table number>.
+  // That is only unambiguous when the business has a single restaurant.
+  if (!UUID_RE.test(branchId)) {
+    const { rows } = await query(`SELECT branch_id FROM restaurant WHERE deleted_at IS NULL`)
+    if (rows.length !== 1) {
+      return res.status(404).json({ success: false, message: 'This QR code is out of date — please ask a member of staff for the menu.' })
+    }
+    branchId = rows[0].branch_id
+  }
+
+  const { rows: [rest] } = await query(
+    `SELECT r.name, r.cuisine_type, r.operating_hours, o.name AS org_name, o.logo_url
+     FROM restaurant r JOIN branch b ON b.id = r.branch_id JOIN organization o ON o.id = b.organization_id
+     WHERE r.branch_id = $1 AND r.deleted_at IS NULL AND b.deleted_at IS NULL`,
+    [branchId]
+  )
+  if (!rest) return res.status(404).json({ success: false, message: 'Menu not found' })
 
   const { rows: cats } = await query(
     `SELECT mc.id, mc.name, mc.display_order
      FROM menu_category mc JOIN restaurant r ON r.id = mc.restaurant_id
      WHERE r.branch_id = $1 AND mc.is_active = TRUE AND mc.deleted_at IS NULL
-     ORDER BY mc.display_order`,
+     ORDER BY mc.display_order, mc.name`,
     [branchId]
   )
 
@@ -181,19 +254,16 @@ export async function getPublicMenu(req: Request, res: Response) {
      JOIN menu_category mc ON mc.id = mi.category_id
      JOIN restaurant r ON r.id = mc.restaurant_id
      WHERE r.branch_id = $1 AND mi.is_available = TRUE AND mi.deleted_at IS NULL
-     ORDER BY mc.display_order, mi.display_order`,
+     ORDER BY mc.display_order, mi.display_order, mi.name`,
     [branchId]
   )
 
-  const { rows: [rest] } = await query(
-    `SELECT name, cuisine_type, operating_hours, tax_rate FROM restaurant WHERE branch_id = $1`,
-    [branchId]
-  )
-
-  const grouped = cats.map(c => ({
-    ...c,
-    items: items.filter(i => i.category_id === c.id),
-  }))
-
-  return res.json({ success: true, data: { restaurant: rest ?? {}, categories: grouped } })
+  return res.json({
+    success: true,
+    data: {
+      restaurant: { name: rest.name, cuisine_type: rest.cuisine_type, operating_hours: rest.operating_hours },
+      organization: { name: rest.org_name, logo_url: rest.logo_url || null },
+      categories: cats.map(c => ({ ...c, items: items.filter(i => i.category_id === c.id) })),
+    },
+  })
 }

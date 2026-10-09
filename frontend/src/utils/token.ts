@@ -1,10 +1,12 @@
 import type { User } from '@/types/auth'
+import { clearApiCache } from './pwa'
 
 const AUTH_TOKEN_KEY = 'somali_nlp_token'
 
 export const getToken = () => localStorage.getItem(AUTH_TOKEN_KEY)
 export const setToken = (token: string) => localStorage.setItem(AUTH_TOKEN_KEY, token)
-export const removeToken = () => localStorage.removeItem(AUTH_TOKEN_KEY)
+// signing out also forgets the offline copy of the menu / staff list kept for the POS
+export const removeToken = () => { localStorage.removeItem(AUTH_TOKEN_KEY); clearApiCache() }
 
 export const parseJwt = (token: string): Record<string, any> | null => {
   try {
@@ -31,8 +33,9 @@ export const getUserFromToken = (token: string): User | null => {
   }
 
   return {
-    id: payload.sub ?? payload.user?.id,
-    email: payload.email ?? payload.user?.email,
-    name: payload.name ?? payload.user?.name,
+    id: payload.userId ?? payload.sub ?? payload.user?.id,
+    email: payload.email ?? payload.user?.email ?? '',
+    full_name: payload.name ?? payload.user?.name ?? '',
+    organization_id: payload.orgId ?? '',
   }
 }

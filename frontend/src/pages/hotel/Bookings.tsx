@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Plus, RefreshCw, Building2, Pencil, Trash2, ArrowRightLeft, Repeat } from 'lucide-react'
+import { Plus, RefreshCw, Building2, Pencil, Trash2, ArrowRightLeft, Repeat, FileText, Banknote } from 'lucide-react'
 import { DataTable, type DTColumn } from '@/components/ui/DataTable'
 import Modal, { INPUT, Field, CancelBtn } from '@/components/ui/Modal'
 import { Select } from '@/components/ui/Select'
@@ -7,6 +7,7 @@ import { DatePicker } from '@/components/ui/DatePicker'
 import api from '@/services/api'
 import { getApiErrorMessage } from '@/services/api'
 import { useLoadMore } from '@hooks/useLoadMore'
+import { BookingPaymentModal } from '@/components/hotel/BookingPaymentModal'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -17,7 +18,7 @@ interface Booking {
   check_in_date: string; check_out_date: string
   num_nights: number; num_adults: number; num_children: number
   rate_per_night: string; total_amount: string
-  status: string; special_requests?: string; created_at: string
+  status: string; source?: string; special_requests?: string; created_at: string
 }
 interface Guest    { id: string; first_name: string; last_name: string; email?: string }
 interface Room     { id: string; room_number: string; room_type_name: string }
@@ -88,6 +89,7 @@ export default function Bookings() {
   const [allRooms,       setAllRooms]       = useState<AllRoom[]>([])
   const [transferRoomId, setTransferRoomId] = useState('')
   const [transferLoading, setTransferLoading] = useState(false)
+  const [payFor, setPayFor] = useState<Booking | null>(null)
   const [exchangeAId, setExchangeAId] = useState('')
   const [exchangeBId, setExchangeBId] = useState('')
 
@@ -264,13 +266,28 @@ export default function Bookings() {
   }
 
   // ── Status actions ─────────────────────────────────────────────────────────
+  // An online request waits as "pending" until the front desk accepts it (the guest is messaged)
+  const doConfirm = async (b: Booking) => {
+    try { await api.patch(`/hotel/bookings/${b.id}/confirm`); load() }
+    catch (e) { alert(getApiErrorMessage(e)) }
+  }
   const doCheckIn  = async (b: Booking) => {
     try { await api.patch(`/hotel/bookings/${b.id}/checkin`);  load() }
     catch (e) { alert(getApiErrorMessage(e)) }
   }
-  const doCheckOut = async (b: Booking) => {
-    try { await api.patch(`/hotel/bookings/${b.id}/checkout`); load() }
-    catch (e) { alert(getApiErrorMessage(e)) }
+  const doCheckOut = async (b: Booking, earlyOk = false) => {
+    try {
+      const r = await api.patch(`/hotel/bookings/${b.id}/checkout`, earlyOk ? { early_ok: true } : {})
+      load()
+      if (r.data?.data?.balance_due > 0) alert(r.data.message)   // tell the cashier what the guest still owes
+    } catch (e: any) {
+      // The guest leaves before the booked departure: the server asks first because it changes the bill
+      if (e?.response?.status === 409 && e.response.data?.data?.code === 'early_checkout') {
+        if (window.confirm(`${e.response.data.message}\n\nCheck out now?`)) return doCheckOut(b, true)
+        return
+      }
+      alert(getApiErrorMessage(e))
+    }
   }
   const doCancel = async () => {
     if (!selected) return
@@ -292,7 +309,8 @@ export default function Bookings() {
 
   const COLS: DTColumn<Booking>[] = [
     { key: 'booking_ref', label: 'Ref #', render: r =>
-        <span className="font-mono font-bold text-indigo-600 dark:text-indigo-400">{r.booking_ref}</span> },
+        <span className="font-mono font-bold text-indigo-600 dark:text-indigo-400">{r.booking_ref}
+          {r.source === 'online' && <span className="ml-1.5 rounded-full bg-sky-100 px-1.5 py-0.5 align-middle font-sans text-[9.5px] font-bold text-sky-700 dark:bg-sky-500/20 dark:text-sky-300">ONLINE</span>}</span> },
     { key: 'guest_name', label: 'Guest', render: r =>
         <span className="font-semibold text-neutral-800 dark:text-neutral-200 whitespace-nowrap">{r.guest_name ?? '—'}</span> },
     { key: 'room_number', label: 'Room', render: r =>
@@ -314,6 +332,23 @@ export default function Bookings() {
         </span> },
     { key: '_act', label: '', sortable: false, render: r => (
       <div className="flex gap-1.5 whitespace-nowrap">
+        {!['cancelled', 'no_show'].includes(r.status) && (
+          <button onClick={() => setPayFor(r)} title="Record a payment from this guest"
+            className="rounded-lg bg-emerald-50 px-2 py-1 text-emerald-600 hover:bg-emerald-100 dark:bg-emerald-500/10 dark:text-emerald-300 transition-colors">
+            <Banknote size={11}/>
+          </button>
+        )}
+        <a href={`/hotel/bookings/${r.id}/statement`} target="_blank" rel="noreferrer"
+          title="Guest statement (room + restaurant) — print / save as PDF"
+          className="rounded-lg bg-amber-50 px-2 py-1 text-amber-600 hover:bg-amber-100 dark:bg-amber-500/10 dark:text-amber-300 transition-colors">
+          <FileText size={11}/>
+        </a>
+        {r.status === 'pending' && (
+          <button onClick={() => doConfirm(r)} title="Accept this booking request"
+            className="rounded-lg bg-indigo-100 px-2.5 py-1 text-[11px] font-bold text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-500/20 dark:text-indigo-300 transition-colors">
+            Confirm
+          </button>
+        )}
         {r.status === 'confirmed' && (
           <button onClick={() => doCheckIn(r)}
             className="rounded-lg bg-emerald-100 px-2.5 py-1 text-[11px] font-bold text-emerald-700 hover:bg-emerald-200 dark:bg-emerald-500/20 dark:text-emerald-300 transition-colors">
@@ -433,6 +468,8 @@ export default function Bookings() {
       <DataTable columns={COLS} data={filtered} title="Bookings" filename="bookings"
         rowKey={r => r.id} searchPlaceholder="Search guest, room, ref…" loading={loading}
         onLoadMore={loadMore} hasMore={hasMore} loadingMore={loadingMore}/>
+
+      <BookingPaymentModal booking={payFor} onClose={() => setPayFor(null)} onDone={load} />
 
       {/* ── New Booking Modal ──────────────────────────────────────────── */}
       <Modal open={mode === 'add'} onClose={close} title="New Booking" size="lg"

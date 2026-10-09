@@ -8,6 +8,7 @@ import { ProtectedRoute } from './components/ProtectedRoute'
 import { PublicRoute } from './components/PublicRoute'
 import { Layout } from './components/Layout'
 import POSLayout from './components/POSLayout'
+import { ApprovalHost } from './components/ApprovalHost'
 import Login from './pages/Login'
 
 // Dashboard
@@ -18,17 +19,20 @@ const Bookings     = lazy(() => import('./pages/hotel/Bookings'))
 const Rooms        = lazy(() => import('./pages/hotel/Rooms'))
 const Guests       = lazy(() => import('./pages/hotel/Guests'))
 const Housekeeping = lazy(() => import('./pages/hotel/Housekeeping'))
+const BookingStatement = lazy(() => import('./pages/hotel/BookingStatement'))
 
 // Restaurant
 const POS          = lazy(() => import('./pages/restaurant/POS'))
 const OrdersTables = lazy(() => import('./pages/restaurant/OrdersTables'))
 const MenuMgmt     = lazy(() => import('./pages/restaurant/Menu'))
+const Kitchen      = lazy(() => import('./pages/restaurant/Kitchen'))
 
 // Inventory
 const Suppliers      = lazy(() => import('./pages/inventory/Suppliers'))
 const Warehouses     = lazy(() => import('./pages/inventory/Warehouses'))
 const Items          = lazy(() => import('./pages/inventory/Items'))
 const PurchaseOrders = lazy(() => import('./pages/inventory/PurchaseOrders'))
+const StockControl   = lazy(() => import('./pages/inventory/StockControl'))
 
 // Accounting / Finance
 const Accounts     = lazy(() => import('./pages/accounting/Accounts'))
@@ -47,6 +51,7 @@ const ModuleConfig = lazy(() => import('./pages/system/ModuleConfig'))
 
 // Public
 const MenuPage = lazy(() => import('./pages/public/MenuPage'))
+const BookPage = lazy(() => import('./pages/public/BookPage'))
 
 const PageLoader = () => (
   <div className="flex h-full min-h-[400px] items-center justify-center">
@@ -66,16 +71,26 @@ export default function App() {
       <LanguageProvider>
       <ToastProvider>
         <AuthProvider>
+          <ApprovalHost />
           <Routes>
             {/* ── Public routes (no auth) ───────────────────── */}
             <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
-            <Route path="/menu/:tableId" element={
+            <Route path="/menu/:branchId" element={
               <Suspense fallback={<div className="flex h-screen items-center justify-center"><div className="h-8 w-8 animate-spin rounded-full border-[3px] border-neutral-200 border-t-orange-500"/></div>}>
                 <MenuPage />
               </Suspense>
             }/>
 
+            <Route path="/book/:branchId" element={
+              <Suspense fallback={<div className="flex h-screen items-center justify-center"><div className="h-8 w-8 animate-spin rounded-full border-[3px] border-neutral-200 border-t-sky-500"/></div>}>
+                <BookPage />
+              </Suspense>
+            }/>
+
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
+
+            {/* ── Printable guest statement (protected, no sidebar) ── */}
+            <Route path="hotel/bookings/:id/statement" element={<ProtectedRoute>{S(BookingStatement)}</ProtectedRoute>} />
 
             {/* ── Standalone POS (protected, no sidebar) ───── */}
             <Route element={<ProtectedRoute><POSLayout /></ProtectedRoute>}>
@@ -95,6 +110,7 @@ export default function App() {
 
               {/* Restaurant */}
               <Route path="restaurant/operations" element={S(OrdersTables)} />
+              <Route path="restaurant/kitchen"    element={S(Kitchen)} />
               <Route path="restaurant/menu"       element={S(MenuMgmt)} />
               {/* Legacy paths → merged Orders & Tables page */}
               <Route path="restaurant/orders" element={<Navigate to="/restaurant/operations" replace />} />
@@ -105,6 +121,7 @@ export default function App() {
               <Route path="inventory/warehouses" element={S(Warehouses)} />
               <Route path="inventory/items"      element={S(Items)} />
               <Route path="inventory/orders"     element={S(PurchaseOrders)} />
+              <Route path="inventory/stock-control" element={S(StockControl)} />
               {/* Legacy path → Items page (Stock Balance tab lives there) */}
               <Route path="inventory/stock" element={<Navigate to="/inventory/items" replace />} />
 

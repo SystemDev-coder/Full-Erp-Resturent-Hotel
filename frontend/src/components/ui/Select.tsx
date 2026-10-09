@@ -40,9 +40,9 @@ export function Select({ value, onChange, options, placeholder, disabled, autoFo
       // small delay so the portal renders before we focus
       const t = setTimeout(() => searchRef.current?.focus(), 30)
       return () => clearTimeout(t)
-    } else {
-      setSearch('')
     }
+    setSearch('')
+    return undefined
   }, [open])
 
   const toggle = () => {

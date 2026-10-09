@@ -1,6 +1,12 @@
 import { Request, Response } from 'express'
 import { query } from '../../db/pool'
 
+// A menu item belongs to a branch through its category → restaurant. The branch id
+// is the LAST bind parameter of whichever query embeds this ($12 in the UPDATE,
+// swapped to $2 in the single-id ones).
+const IN_BRANCH = `category_id IN (
+  SELECT mc.id FROM menu_category mc JOIN restaurant r ON r.id = mc.restaurant_id WHERE r.branch_id = $12)`
+
 export async function listMenuCategories(req: Request, res: Response) {
   const { branchId } = req.auth!
   const { rows } = await query(
@@ -38,6 +44,9 @@ export async function createMenuItem(req: Request, res: Response) {
 
   if (!category_id || !name || price == null) {
     return res.status(400).json({ success: false, message: 'category_id, name, and price are required' })
+  }
+  if (!Number.isFinite(Number(price)) || Number(price) < 0 || !Number.isFinite(Number(cost_price)) || Number(cost_price) < 0) {
+    return res.status(400).json({ success: false, message: 'price and cost_price cannot be negative' })
   }
 
   // Verify category belongs to this branch
@@ -82,11 +91,11 @@ export async function updateMenuItem(req: Request, res: Response) {
        image_url          = COALESCE($9, image_url),
        display_order      = COALESCE($10, display_order),
        updated_at         = NOW()
-     WHERE id = $11 AND deleted_at IS NULL
+     WHERE id = $11 AND deleted_at IS NULL AND ${IN_BRANCH}
      RETURNING id, name, price, is_available`,
     [name ?? null, description ?? null, price ?? null, cost_price ?? null,
      item_type ?? null, is_halal ?? null, is_vegetarian ?? null,
-     prep_time_minutes ?? null, image_url ?? null, display_order ?? null, id]
+     prep_time_minutes ?? null, image_url ?? null, display_order ?? null, id, req.auth!.branchId]
   )
   if (!rows[0]) return res.status(404).json({ success: false, message: 'Menu item not found' })
   return res.json({ success: true, data: rows[0] })
@@ -94,8 +103,22 @@ export async function updateMenuItem(req: Request, res: Response) {
 
 export async function toggleAvailable(req: Request, res: Response) {
   const { rows } = await query(
-    `UPDATE menu_item SET is_available = NOT is_available WHERE id = $1 RETURNING is_available`,
-    [req.params.id]
+    `UPDATE menu_item SET is_available = NOT is_available
+     WHERE id = $1 AND deleted_at IS NULL AND ${IN_BRANCH.replace('$12', '$2')} RETURNING is_available`,
+    [req.params.id, req.auth!.branchId]
   )
-  return res.json({ success: true, is_available: rows[0]?.is_available })
+  if (!rows[0]) return res.status(404).json({ success: false, message: 'Menu item not found' })
+  return res.json({ success: true, is_available: rows[0].is_available })
+}
+
+// The Menu page's delete button always called this route, which did not exist (404).
+// Soft delete — past orders keep their own copy of the item name/price.
+export async function deleteMenuItem(req: Request, res: Response) {
+  const { rows } = await query(
+    `UPDATE menu_item SET deleted_at = NOW(), deleted_by = $3, is_available = FALSE
+     WHERE id = $1 AND deleted_at IS NULL AND ${IN_BRANCH.replace('$12', '$2')} RETURNING id`,
+    [req.params.id, req.auth!.branchId, req.auth!.userId]
+  )
+  if (!rows[0]) return res.status(404).json({ success: false, message: 'Menu item not found' })
+  return res.json({ success: true })
 }

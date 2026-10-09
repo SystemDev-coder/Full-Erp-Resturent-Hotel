@@ -4,6 +4,7 @@ import { DataTable, type DTColumn } from '@/components/ui/DataTable'
 import Modal, { INPUT, Field, CancelBtn } from '@/components/ui/Modal'
 import { ImageThumb } from '@/components/ui/ImageThumb'
 import ImageModal from '@/components/ui/ImageModal'
+import { isImageFile } from '@utils/imageFile'
 import api from '@/services/api'
 import { getApiErrorMessage } from '@/services/api'
 
@@ -46,14 +47,13 @@ export default function Menu() {
   const [viewImage,  setViewImage]  = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
-  const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/jpg']
   const MAX_IMAGE_BYTES = 15 * 1024 * 1024
 
   const onPickImage = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     e.target.value = ''
     if (!file) return
-    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+    if (!isImageFile(file)) {
       setError('Unsupported image format — please use JPG, PNG, or WebP.'); return
     }
     if (file.size > MAX_IMAGE_BYTES) {

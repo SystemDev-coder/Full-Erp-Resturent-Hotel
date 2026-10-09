@@ -1,11 +1,14 @@
-import { Router } from 'express'
-import { requireAuth } from '../middleware/auth'
+import { safeRouter } from '../utils/safeRouter'
+import { requireAuth, requireModule } from '../middleware/auth'
 import { enforceModulePermission, enforceSubmodulePermission } from '../middleware/permissions'
 import {
   listBookings, getBooking, createBooking,
   updateBooking, deleteBooking,
   checkIn, checkOut, cancelBooking, transferRoom, exchangeRooms,
 } from '../controllers/hotel/bookingController'
+import { getBookingStatement } from '../controllers/hotel/statementController'
+import { confirmBooking } from '../controllers/hotel/onlineBookingController'
+import { recordBookingPayment } from '../controllers/hotel/bookingPaymentController'
 import {
   listRooms, getRoom, createRoom, updateRoom, deleteRoom, updateRoomStatus,
 } from '../controllers/hotel/roomController'
@@ -23,8 +26,9 @@ import {
   listAvailableRooms,
 } from '../controllers/hotel/roomTypeController'
 
-export const hotelRouter = Router()
+export const hotelRouter = safeRouter()
 hotelRouter.use(requireAuth)
+hotelRouter.use(requireModule('hotel'))
 hotelRouter.use(enforceModulePermission('hotel'))
 
 // Sub-page gates — layered on top of the module-level check above, one per
@@ -61,7 +65,10 @@ hotelRouter.patch ('/rooms/:id/status',   updateRoomStatus)
 // ── Bookings ──────────────────────────────────────────────────────────────────
 hotelRouter.get   ('/bookings',                    listBookings)
 hotelRouter.get   ('/bookings/:id',                getBooking)
+hotelRouter.get   ('/bookings/:id/statement',      getBookingStatement)
+hotelRouter.post  ('/bookings/:id/payments',       recordBookingPayment)
 hotelRouter.post  ('/bookings',                    createBooking)
+hotelRouter.patch ('/bookings/:id/confirm',        confirmBooking)
 hotelRouter.put   ('/bookings/:id',                updateBooking)
 hotelRouter.delete('/bookings/:id',                deleteBooking)
 hotelRouter.patch ('/bookings/:id/checkin',        checkIn)

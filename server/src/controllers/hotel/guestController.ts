@@ -26,7 +26,10 @@ export async function listGuests(req: Request, res: Response) {
 }
 
 export async function getGuest(req: Request, res: Response) {
-  const { rows } = await query(`SELECT * FROM guest WHERE id = $1 AND deleted_at IS NULL`, [req.params.id])
+  const { rows } = await query(
+    `SELECT * FROM guest WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL`,
+    [req.params.id, req.auth!.orgId]
+  )
   if (!rows[0]) return res.status(404).json({ success: false, message: 'Guest not found' })
   return res.json({ success: true, data: rows[0] })
 }
@@ -105,20 +108,34 @@ export async function updateGuest(req: Request, res: Response) {
        address           = COALESCE($11, address),
        notes             = COALESCE($12, notes),
        updated_at        = NOW()
-     WHERE id = $13 AND deleted_at IS NULL
+     WHERE id = $13 AND organization_id = $14 AND deleted_at IS NULL
      RETURNING id, first_name, last_name, email, phone`,
     [first_name ?? null, last_name ?? null, email ?? null, phone ?? null,
      id_type ?? null, id_number ?? null, id_document_image ?? null, nationality ?? null,
-     date_of_birth ?? null, gender ?? null, address ?? null, notes ?? null, id]
+     date_of_birth ?? null, gender ?? null, address ?? null, notes ?? null, id, req.auth!.orgId]
   )
   if (!rows[0]) return res.status(404).json({ success: false, message: 'Guest not found' })
   return res.json({ success: true, data: rows[0] })
 }
 
 export async function deleteGuest(req: Request, res: Response) {
-  await query(
-    `UPDATE guest SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1`,
-    [req.params.id]
+  const { orgId, userId } = req.auth!
+  const { id } = req.params
+
+  const { rows: open } = await query(
+    `SELECT 1 FROM booking
+     WHERE primary_guest_id = $1 AND deleted_at IS NULL AND status IN ('pending','confirmed','checked_in') LIMIT 1`,
+    [id]
   )
+  if (open[0]) {
+    return res.status(409).json({ success: false, message: 'This guest has active or upcoming bookings — cancel or complete them first' })
+  }
+
+  const { rows } = await query(
+    `UPDATE guest SET deleted_at = NOW(), deleted_by = $3, updated_at = NOW()
+     WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL RETURNING id`,
+    [id, orgId, userId]
+  )
+  if (!rows[0]) return res.status(404).json({ success: false, message: 'Guest not found' })
   return res.json({ success: true })
 }

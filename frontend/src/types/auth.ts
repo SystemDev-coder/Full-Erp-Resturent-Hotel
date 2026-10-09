@@ -54,7 +54,9 @@ export interface AuthContextValue {
   user: User | null
   isAuthenticated: boolean
   isLoading: boolean
-  login: (credentials: LoginCredentials) => Promise<void>
+  /** Resolves with a challenge when the account has two-factor on — finish with verifyTwoFactor(). */
+  login: (credentials: LoginCredentials) => Promise<{ challenge: string } | void>
+  verifyTwoFactor: (challenge: string, code: string) => Promise<void>
   register: (payload: RegisterPayload) => Promise<void>
   logout: () => void
   /** Switch the active branch — gets a new branch-scoped token then reloads data. */

@@ -17,6 +17,7 @@ import ImageModal from '@/components/ui/ImageModal'
 import { ROLE_LABELS } from '@/types/auth'
 import type { ERPRole } from '@/types/auth'
 import { MODULE_PERMISSIONS, ALL_ROLES } from '@/config/rolePermissions'
+import { isImageFile } from '@utils/imageFile'
 import api from '@/services/api'
 import { getApiErrorMessage } from '@/services/api'
 import { useToast } from '@/contexts/ToastContext'
@@ -27,7 +28,7 @@ import { useLoadMore } from '@hooks/useLoadMore'
 
 interface UserRow {
   id: string; email: string; full_name: string; phone?: string; avatar_url?: string
-  is_active: boolean; is_locked: boolean; last_login_at?: string
+  is_active: boolean; is_locked: boolean; last_login_at?: string; totp_enabled?: boolean
   failed_attempts: number; locked_until?: string; created_at: string
   branches: { branch_id: string; role: ERPRole; branch_name: string }[]
 }
@@ -65,7 +66,6 @@ const ACTION_BADGE: Record<string, string> = {
 const SECURITY_ACTIONS = ['LOGIN_SUCCESS', 'LOGIN_FAILED', 'USER_LOCKED', 'USER_UNLOCKED', 'USER_SESSIONS_REVOKED', 'USER_PASSWORD_RESET', 'USER_PERMISSIONS_UPDATED']
 
 const ROLE_OPTIONS = Object.entries(ROLE_LABELS).map(([value, label]) => ({ value, label }))
-const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/jpg']
 const MAX_IMAGE_BYTES = 15 * 1024 * 1024
 
 interface InviteForm { full_name: string; email: string; phone: string; branch_id: string; role: string; password: string }
@@ -102,10 +102,12 @@ const SUBMODULE_DEFS: Record<string, SubModuleDef[]> = {
   restaurant: [
     { key: 'pos',        label: 'POS' },
     { key: 'operations', label: 'Orders & Tables' },
+    { key: 'kitchen',    label: 'Kitchen' },
     { key: 'menu',       label: 'Menu' },
   ],
   inventory: [
     { key: 'items',      label: 'Items' },
+    { key: 'stock-control', label: 'Stock Control' },
     { key: 'warehouses', label: 'Warehouses' },
     { key: 'suppliers',  label: 'Suppliers' },
     { key: 'orders',     label: 'Purchase Orders' },
@@ -216,6 +218,13 @@ export default function Settings() {
 
   useEffect(() => { load() }, [load])
 
+  // Someone lost their phone: an administrator switches their two-factor off so they can sign in and set it up again
+  const resetTwoFactor = async (u: UserRow) => {
+    if (!window.confirm(`Reset two-factor sign-in for ${u.full_name}? They will sign in with the password only until they set it up again.`)) return
+    try { await api.post(`/users/${u.id}/2fa/reset`); showToast(`Two-factor reset for ${u.full_name}`, 'success'); load() }
+    catch (e) { showToast(getApiErrorMessage(e), 'error') }
+  }
+
   const loadAll = useCallback(() => { reloadLogs(); load() }, [reloadLogs, load])
 
   const close = () => { setMode(null); setError(''); setTempPw(''); setActiveUser(null); setPickerUserId(''); clearImage() }
@@ -225,7 +234,7 @@ export default function Settings() {
     const file = e.target.files?.[0]
     e.target.value = ''
     if (!file) return
-    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) { setError('Unsupported image format — please use JPG, PNG, or WebP.'); return }
+    if (!isImageFile(file)) { setError('That file is not an image — choose a JPG, PNG, WebP, GIF, SVG or AVIF picture.'); return }
     if (file.size > MAX_IMAGE_BYTES) { setError('Image is too large — please use a file under 15MB.'); return }
     setError('')
     setImgFile(file)
@@ -496,6 +505,9 @@ export default function Settings() {
         <div className="flex items-center justify-end gap-1.5">
           <button title="View" onClick={()=>openView(u)} className="flex h-7 w-7 items-center justify-center rounded-lg bg-neutral-100 text-neutral-500 hover:bg-neutral-200 dark:bg-white/[0.06] dark:text-neutral-400 transition-colors"><Eye size={13}/></button>
           <button title="Edit" onClick={()=>openEdit(u)} className="flex h-7 w-7 items-center justify-center rounded-lg bg-sky-50 text-sky-600 hover:bg-sky-100 dark:bg-sky-500/10 dark:text-sky-400 transition-colors"><Pencil size={13}/></button>
+          {u.totp_enabled && me?.current_branch?.role === 'org_admin' && (
+            <button title="Two-factor is on — reset it (lost phone)" onClick={()=>resetTwoFactor(u)} className="flex h-7 items-center gap-1 rounded-lg bg-violet-50 px-2 text-[10.5px] font-bold text-violet-600 hover:bg-violet-100 dark:bg-violet-500/10 dark:text-violet-300 transition-colors"><ShieldCheck size={12}/> 2FA</button>
+          )}
           {!isSelf && (u.is_active
             ? <button title="Deactivate" onClick={()=>setConfirmAction({type:'deactivate',user:u})} className="flex h-7 w-7 items-center justify-center rounded-lg bg-neutral-100 text-neutral-500 hover:bg-neutral-200 dark:bg-white/[0.06] dark:text-neutral-400 transition-colors"><ShieldOff size={13}/></button>
             : <button title="Activate" onClick={()=>setConfirmAction({type:'activate',user:u})} className="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-50 text-emerald-600 hover:bg-emerald-100 dark:bg-emerald-500/10 dark:text-emerald-400 transition-colors"><ShieldCheck size={13}/></button>)}

@@ -30,6 +30,8 @@ export const TRANSLATIONS: Record<string, Entry> = {
   'nav.restaurant':     { en: 'Restaurant',       so: 'Maqaayadda' },
   'nav.pos':            { en: 'POS Cashier',      so: 'Khasnadda POS' },
   'nav.ordersTables':   { en: 'Orders & Tables',  so: 'Dalabaadka & Miisaska' },
+  'nav.kitchen':        { en: 'Kitchen',          so: 'Jikada' },
+  'nav.stockControl':   { en: 'Stock Control',    so: 'Xakamaynta Kaydka' },
   'nav.orders':         { en: 'Orders',           so: 'Dalabaadka' },
   'nav.tables':         { en: 'Tables',           so: 'Miisaska' },
   'nav.menu':           { en: 'Menu',             so: 'Menyuuga' },

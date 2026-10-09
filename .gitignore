@@ -14,6 +14,9 @@ build/
 # User-uploaded content (menu photos, avatars, documents)
 server/uploads/
 
+# Database backups (contain ALL business data — never commit)
+server/backups/
+
 # Logs & OS noise
 *.log
 npm-debug.log*

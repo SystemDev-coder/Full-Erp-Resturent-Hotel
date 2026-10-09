@@ -1,5 +1,5 @@
-import { Router } from 'express'
-import { requireAuth } from '../middleware/auth'
+import { safeRouter } from '../utils/safeRouter'
+import { requireAuth, requireModule } from '../middleware/auth'
 import { enforceModulePermission, enforceSubmodulePermission } from '../middleware/permissions'
 import {
   listAPInvoices, getAPInvoice, createAPInvoice, payAPInvoice, voidAPInvoice,
@@ -32,9 +32,32 @@ import {
   listReceipts, getReceipt, createReceipt, updateReceipt, deleteReceipt,
 } from '../controllers/accounting/receiptController'
 
-export const accountingRouter = Router()
+import { getReportDetail } from '../controllers/accounting/reportDetailController'
+import { getFinanceReport } from '../controllers/accounting/financeReportController'
+import { getVatReport } from '../controllers/accounting/vatReportController'
+import { getWaiterSales } from '../controllers/accounting/waiterSalesController'
+
+export const accountingRouter = safeRouter()
 accountingRouter.use(requireAuth)
+accountingRouter.use(requireModule('accounting'))
 accountingRouter.use(enforceModulePermission('finance'))
+
+// WHO may touch Finance, by role (not only by the optional per-user permission rows, which default to "allowed"):
+//   • managers, accountant, hotel cashier ........ everything
+//   • report viewer .............................. the reports (read only)
+//   • cashier / waiter / bar / receptionist ...... only what the till needs: the account list and taking a payment
+//   • everyone else (chef, housekeeper, inventory) nothing
+// A waiter therefore cannot open Receipts, expenses, salaries, transfers or reports even by calling the API directly.
+const FINANCE_FULL = ['org_admin', 'branch_manager', 'accountant', 'hotel_cashier']
+const TILL_ROLES = ['cashier', 'waiter', 'bar_staff', 'receptionist']
+const TILL_ALLOWED: [string, RegExp][] = [['GET', /^\/accounts\/?$/], ['POST', /^\/invoices\/[0-9a-f-]{36}\/payment\/?$/i]]
+accountingRouter.use((req, res, next) => {
+  const role = req.auth!.role
+  if (FINANCE_FULL.includes(role)) return next()
+  if (role === 'report_viewer' && req.method === 'GET' && req.path.startsWith('/reports')) return next()
+  if (TILL_ROLES.includes(role) && TILL_ALLOWED.some(([m, re]) => m === req.method && re.test(req.path))) return next()
+  return res.status(403).json({ success: false, message: 'Your role does not have access to Finance.' })
+})
 
 // Sub-page gates — one per nav item (Accounts / Receipts / Expenses / Salary).
 // Assets, POS Sessions, Profit Sharing, AP Invoices and Reports live on the
@@ -139,3 +162,7 @@ accountingRouter.delete('/profit-sharing/:id',    deleteProfitSharing)
 
 // ── Reports ───────────────────────────────────────────────────────────────────
 accountingRouter.get  ('/reports/summary',        getReportsSummary)
+accountingRouter.get  ('/reports/finance',         getFinanceReport)
+accountingRouter.get  ('/reports/vat',             getVatReport)
+accountingRouter.get  ('/reports/waiters',         getWaiterSales)
+accountingRouter.get  ('/reports/detail/:kind',   getReportDetail)

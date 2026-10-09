@@ -27,8 +27,8 @@ export async function createDepartment(req: Request, res: Response) {
 export async function updateDepartment(req: Request, res: Response) {
   const { name } = req.body
   const { rows } = await query(
-    `UPDATE department SET name = $1 WHERE id = $2 AND deleted_at IS NULL RETURNING id, name`,
-    [name, req.params.id]
+    `UPDATE department SET name = $1 WHERE id = $2 AND branch_id = $3 AND deleted_at IS NULL RETURNING id, name`,
+    [name, req.params.id, req.auth!.branchId]
   )
   if (!rows[0]) return res.status(404).json({ success: false, message: 'Department not found' })
   return res.json({ success: true, data: rows[0] })
@@ -38,8 +38,8 @@ export async function deleteDepartment(req: Request, res: Response) {
   // A department with staff still assigned can't be removed — reassign them first
   const { rows } = await query(
     `SELECT COUNT(*) AS n FROM staff
-     WHERE department_id = $1 AND deleted_at IS NULL AND is_active = TRUE`,
-    [req.params.id]
+     WHERE department_id = $1 AND branch_id = $2 AND deleted_at IS NULL AND is_active = TRUE`,
+    [req.params.id, req.auth!.branchId]
   )
   if (Number(rows[0]?.n) > 0) {
     return res.status(409).json({
@@ -47,7 +47,8 @@ export async function deleteDepartment(req: Request, res: Response) {
       message: `This department still has ${rows[0].n} active staff member(s) — move them to another department first`,
     })
   }
-  await query(`UPDATE department SET deleted_at = NOW() WHERE id = $1`, [req.params.id])
+  const del = await query(`UPDATE department SET deleted_at = NOW() WHERE id = $1 AND branch_id = $2 AND deleted_at IS NULL RETURNING id`, [req.params.id, req.auth!.branchId])
+  if (!del.rows[0]) return res.status(404).json({ success: false, message: 'Department not found' })
   return res.json({ success: true })
 }
 
@@ -59,11 +60,12 @@ export async function getPayrollLines(req: Request, res: Response) {
             s.first_name || ' ' || s.last_name AS staff_name,
             s.employee_id, d.name AS department_name
      FROM payroll_line pl
+     JOIN payroll_run pr ON pr.id = pl.payroll_run_id
      JOIN staff s ON s.id = pl.staff_id
      LEFT JOIN department d ON d.id = s.department_id
-     WHERE pl.payroll_run_id = $1
+     WHERE pl.payroll_run_id = $1 AND pr.branch_id = $2 AND pr.deleted_at IS NULL
      ORDER BY s.first_name`,
-    [req.params.id]
+    [req.params.id, req.auth!.branchId]
   )
   return res.json({ success: true, data: rows })
 }

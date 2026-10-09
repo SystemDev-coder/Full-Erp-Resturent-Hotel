@@ -1,5 +1,5 @@
-import { Router } from 'express'
-import { requireAuth } from '../middleware/auth'
+import { safeRouter } from '../utils/safeRouter'
+import { requireAuth, requireModule } from '../middleware/auth'
 import { enforceModulePermission, enforceSubmodulePermission } from '../middleware/permissions'
 import { listStock, adjustStock, getLowStock } from '../controllers/inventory/stockController'
 import {
@@ -13,8 +13,14 @@ import {
   listMovements, listRecipes,
 } from '../controllers/inventory/itemController'
 
-export const inventoryRouter = Router()
+import {
+  listWaste, recordWaste, listStockTakes, startStockTake, getStockTake, saveCounts,
+  completeStockTake, cancelStockTake, getCosting, applyCosting,
+} from '../controllers/inventory/stockControlController'
+
+export const inventoryRouter = safeRouter()
 inventoryRouter.use(requireAuth)
+inventoryRouter.use(requireModule('inventory'))
 inventoryRouter.use(enforceModulePermission('inventory'))
 
 // Sub-page gates — one per nav item; stock adjustments/movements and recipes
@@ -22,6 +28,7 @@ inventoryRouter.use(enforceModulePermission('inventory'))
 inventoryRouter.use('/items',           enforceSubmodulePermission('inventory', 'items'))
 inventoryRouter.use('/stock',           enforceSubmodulePermission('inventory', 'items'))
 inventoryRouter.use('/recipes',         enforceSubmodulePermission('inventory', 'items'))
+for (const p of ['/waste', '/stock-takes', '/costing']) inventoryRouter.use(p, enforceSubmodulePermission('inventory', 'stock-control'))
 inventoryRouter.use('/warehouses',      enforceSubmodulePermission('inventory', 'warehouses'))
 inventoryRouter.use('/suppliers',       enforceSubmodulePermission('inventory', 'suppliers'))
 inventoryRouter.use('/purchase-orders', enforceSubmodulePermission('inventory', 'orders'))
@@ -51,6 +58,18 @@ inventoryRouter.get   ('/stock',                      listStock)
 inventoryRouter.get   ('/stock/low',                  getLowStock)
 inventoryRouter.post  ('/stock/adjust',               adjustStock)
 inventoryRouter.get   ('/stock/movements',            listMovements)
+
+// ── Stock control: waste, stock-take, recipe costing ─────────────────────────
+inventoryRouter.get   ('/waste',                      listWaste)
+inventoryRouter.post  ('/waste',                      recordWaste)
+inventoryRouter.get   ('/stock-takes',                listStockTakes)
+inventoryRouter.post  ('/stock-takes',                startStockTake)
+inventoryRouter.get   ('/stock-takes/:id',            getStockTake)
+inventoryRouter.patch ('/stock-takes/:id/counts',     saveCounts)
+inventoryRouter.post  ('/stock-takes/:id/complete',   completeStockTake)
+inventoryRouter.post  ('/stock-takes/:id/cancel',     cancelStockTake)
+inventoryRouter.get   ('/costing',                    getCosting)
+inventoryRouter.post  ('/costing/apply',              applyCosting)
 
 // ── Recipes ───────────────────────────────────────────────────────────────────
 inventoryRouter.get   ('/recipes',        listRecipes)

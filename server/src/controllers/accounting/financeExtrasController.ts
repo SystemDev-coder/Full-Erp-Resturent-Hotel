@@ -234,8 +234,8 @@ export async function getReportsSummary(req: Request, res: Response) {
     ),
     // Restaurant orders in period
     query(
-      `SELECT COUNT(*) AS total_orders,
-              COALESCE(SUM(total_amount), 0) AS order_revenue,
+      `SELECT COUNT(*) FILTER (WHERE status <> 'cancelled') AS total_orders,
+              COALESCE(SUM(total_amount) FILTER (WHERE status <> 'cancelled'), 0) AS order_revenue,
               COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled
        FROM order_header
        WHERE branch_id = $1 AND deleted_at IS NULL

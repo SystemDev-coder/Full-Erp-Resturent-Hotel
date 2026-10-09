@@ -1,14 +1,22 @@
-import { useState, useMemo, useEffect, useCallback } from 'react'
+import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import {
   Search, Plus, Minus, Trash2, CreditCard, X,
   ShoppingCart, Banknote, Smartphone, Zap, RefreshCw,
-  ChefHat, Lock, Delete, UserCircle2, UtensilsCrossed,
+  ChefHat, Lock, Delete, UserCircle2, UtensilsCrossed, WifiOff, UploadCloud, AlertTriangle,
 } from 'lucide-react'
+import axios from 'axios'
 import api from '@/services/api'
 import { getApiErrorMessage } from '@/services/api'
 import { Select } from '@/components/ui/Select'
 import { useAuth } from '@hooks/useAuth'
-import { printHtml, esc, companyHeader, type OrgInfo } from '@utils/print'
+import { withApproval, isApprovalCancelled, type ApprovalBody } from '@utils/approval'
+import {
+  addToOutbox, loadOutbox, newClientRef, isNetworkError, removeFromOutbox, retryOutboxEntry, subscribeOutbox, syncOutbox,
+  type OutboxEntry,
+} from '@utils/offlineQueue'
+import { rememberPin, forgetPin, verifyLocalPin } from '@utils/localPin'
+import { ReadyAlerts } from '@/components/ReadyAlerts'
+import { printHtml, esc, companyHeader, setFooterOrg, type OrgInfo } from '@utils/print'
 import type { PaymentMethod } from '@/types/restaurant'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -25,10 +33,33 @@ interface ApiTable    { id: string; table_number: string; area_name: string; cap
 interface PosStaff {
   id: string; first_name: string; last_name: string; role: string
   employee_id: string; has_pin: boolean
+  is_me?: boolean        // this staff profile belongs to the person signed in to the system
 }
 interface PosGuest { id: string; first_name: string; last_name: string; phone?: string }
 interface ActiveWaiter { id: string; name: string; role: string }
 interface ApiAccount { id: string; name: string; account_type: string }
+
+// ─── Per-waiter order drafts ──────────────────────────────────────────────────
+// Each waiter's unfinished order is kept in localStorage under their own staff id.
+// Locking the POS, leaving via "Exit POS", closing the tab or even a session
+// timeout therefore never loses an order — it is restored when that same waiter
+// unlocks again, and never shown to a different waiter.
+
+interface Draft { cart: CartItem[]; tableId: string; discount: number; note: string; guestId: string }
+const draftKey = (staffId: string) => `pos_draft_${staffId}`
+
+const loadDraft = (staffId: string): Draft | null => {
+  try {
+    const raw = localStorage.getItem(draftKey(staffId))
+    return raw ? (JSON.parse(raw) as Draft) : null
+  } catch { return null }
+}
+const saveDraft = (staffId: string, d: Draft) => {
+  try { localStorage.setItem(draftKey(staffId), JSON.stringify(d)) } catch { /* storage unavailable */ }
+}
+const clearDraft = (staffId: string) => {
+  try { localStorage.removeItem(draftKey(staffId)) } catch { /* storage unavailable */ }
+}
 
 // ─── POS Page ─────────────────────────────────────────────────────────────────
 
@@ -52,13 +83,21 @@ export default function POS() {
   const [payMethod,  setPayMethod]  = useState<PaymentMethod>('cash')
   const [amountPaid, setAmountPaid] = useState('')
   const [discount,   setDiscount]   = useState(0)
+  // Manager-approval limit for discounts (a manager signed in approves themselves)
+  const [approvalPolicy, setApprovalPolicy] = useState<{ limit: number; self: boolean }>({ limit: 10, self: false })
   const [note,       setNote]       = useState('')
   const [guestName,  setGuestName]  = useState('')
   const [roomNumber, setRoomNumber] = useState('')
+  // Room charge is tied to a real checked-in booking so the bill lands on that guest's statement
+  const [inHouse,    setInHouse]    = useState<{ id: string; guest_id: string; guest_name: string; room_number: string; booking_ref: string }[]>([])
+  const [bookingId,  setBookingId]  = useState('')
 
   // Waiter PIN lock — nobody uses the POS anonymously
   const [posStaff, setPosStaff] = useState<PosStaff[]>([])
   const [waiter,   setWaiter]   = useState<ActiveWaiter | null>(null)
+  // Staff id whose draft has been loaded — auto-save only runs after restore, so an
+  // empty cart can never overwrite a saved draft during unlock.
+  const restoredFor = useRef<string | null>(null)
   const [pinFor,   setPinFor]   = useState<PosStaff | null>(null)
   const [pinInput, setPinInput] = useState('')
   const [pinBusy,  setPinBusy]  = useState(false)
@@ -72,10 +111,52 @@ export default function POS() {
   const [accounts,  setAccounts]  = useState<ApiAccount[]>([])
   const [accountId, setAccountId] = useState('')
 
+  // ── Offline mode ───────────────────────────────────────────────────────────
+  // No internet → the POS keeps working: orders wait in this browser's outbox and are sent automatically.
+  const [online, setOnline] = useState(() => navigator.onLine)
+  const [outbox, setOutbox] = useState<OutboxEntry[]>(() => loadOutbox())
+  const [sending, setSending] = useState(false)
+  const [showOutbox, setShowOutbox] = useState(false)
+
+  const flushOutbox = useCallback(async (quiet = false) => {
+    if (loadOutbox().filter(x => x.status === 'pending').length === 0) return
+    setSending(true)
+    const r = await syncOutbox(api)
+    setSending(false)
+    if (r.synced > 0) { setSuccess(`${r.synced} offline order${r.synced === 1 ? '' : 's'} sent to the server`); setTimeout(() => setSuccess(''), 4000) }
+    else if (!quiet && r.offline) setError('Still no connection — your orders are safe and will be sent automatically.')
+    if (r.failed > 0) setShowOutbox(true)
+  }, [])
+
+  useEffect(() => {
+    const up = () => { setOnline(true); flushOutbox(true) }
+    const down = () => setOnline(false)
+    window.addEventListener('online', up); window.addEventListener('offline', down)
+    const off = subscribeOutbox(setOutbox)
+    flushOutbox(true)                                        // orders left from an earlier session
+    const tick = setInterval(() => { if (navigator.onLine) flushOutbox(true) }, 30_000)
+    return () => { window.removeEventListener('online', up); window.removeEventListener('offline', down); off(); clearInterval(tick) }
+  }, [flushOutbox])
+
+  useEffect(() => {
+    if (payMethod !== 'room_charge') return
+    api.get('/restaurant/pos/in-house')
+      .then(r => setInHouse(r.data.data))
+      .catch(e => setError(getApiErrorMessage(e)))
+  }, [payMethod])
+
+  const pickBooking = (id: string) => {
+    setBookingId(id)
+    const b = inHouse.find(x => x.id === id)
+    setGuestName(b?.guest_name ?? '')
+    setRoomNumber(b?.room_number ?? '')
+    setGuestId(b?.guest_id ?? '')
+  }
+
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const [iRes, cRes, tRes, oRes, sRes, gRes, aRes] = await Promise.all([
+      const [iRes, cRes, tRes, oRes, sRes, gRes, aRes, pRes] = await Promise.all([
         api.get('/restaurant/menu/items'),
         api.get('/restaurant/menu/categories'),
         api.get('/restaurant/tables'),
@@ -83,13 +164,15 @@ export default function POS() {
         api.get('/restaurant/pos/staff').catch(() => null),
         api.get('/hotel/guests').catch(() => null),
         api.get('/accounting/accounts').catch(() => null),
+        api.get('/restaurant/approvals/policy').catch(() => null),
       ])
       setMenuItems(iRes.data.data)
       setMenuCats(cRes.data.data)
       setTables(tRes.data.data)
-      if (oRes) setOrg(oRes.data.data)
+      if (oRes) { setOrg(oRes.data.data); setFooterOrg(oRes.data.data?.name) }
       if (sRes) setPosStaff(sRes.data.data)
       if (gRes) setGuests(gRes.data.data)
+      if (pRes) setApprovalPolicy({ limit: Number(pRes.data.data.policy.discount_over_pct), self: !!pRes.data.data.self_approves })
       if (tRes.data.data.length > 0) setTableId(tRes.data.data[0].id)
       if (aRes) {
         const accs: ApiAccount[] = aRes.data.data
@@ -112,8 +195,41 @@ export default function POS() {
     if (!pinFor || pinInput.length < 4) return
     setPinBusy(true); setPinError('')
     try {
-      const r = await api.post('/restaurant/pos/verify-pin', { staff_id: pinFor.id, pin: pinInput })
-      setWaiter(r.data.data)
+      // Offline: check against the hash this device remembered from the last online unlock
+      const unlockOffline = async (): Promise<ActiveWaiter> => {
+        const res = await verifyLocalPin(pinFor.id, pinInput)
+        if (!res.ok) throw new Error(res.message)
+        return { id: pinFor.id, name: `${pinFor.first_name} ${pinFor.last_name}`, role: pinFor.role }
+      }
+      let who: ActiveWaiter
+      if (!navigator.onLine) who = await unlockOffline()
+      else {
+        try {
+          const r = await api.post('/restaurant/pos/verify-pin', { staff_id: pinFor.id, pin: pinInput })
+          who = r.data.data
+          void rememberPin(who.id, pinInput)
+        } catch (e) {
+          if (isNetworkError(e)) who = await unlockOffline()
+          else { if (axios.isAxiosError(e) && (e.response?.status === 400 || e.response?.status === 409)) forgetPin(pinFor.id); throw e }
+        }
+      }
+
+      // Bring back this waiter's unfinished order (prices/availability refreshed from the live menu)
+      const draft = loadDraft(who.id)
+      restoredFor.current = who.id
+      if (draft && draft.cart.length > 0) {
+        const live = new Map(menuItems.map(m => [m.id, m]))
+        setCart(draft.cart
+          .filter(i => live.get(i.id)?.is_available)
+          .map(i => ({ ...i, price: Number(live.get(i.id)!.price) })))
+        setTableId(draft.tableId)
+        setDiscount(draft.discount)
+        setNote(draft.note)
+        setGuestId(draft.guestId)
+        setSuccess('Welcome back — your open order was restored')
+        setTimeout(() => setSuccess(''), 3000)
+      }
+      setWaiter(who)
       setPinFor(null); setPinInput('')
     } catch (e) {
       // Keep the PIN pad open with the digits still entered so the waiter can
@@ -122,7 +238,54 @@ export default function POS() {
     } finally { setPinBusy(false) }
   }
 
-  const lockPos = () => { setWaiter(null); setPinFor(null); setPinInput(''); setPinError('') }
+  // Lock = sign the waiter out of the POS only (the app session stays). Their open
+  // order is already saved; the screen is cleared so the next waiter starts fresh.
+  const lockPos = () => {
+    restoredFor.current = null
+    setWaiter(null); setPinFor(null); setPinInput(''); setPinError('')
+    setCart([]); setDiscount(0); setNote(''); setGuestId('')
+    setBookingId(''); setGuestName(''); setRoomNumber('')
+    setPayOpen(false); setAmountPaid('')
+  }
+
+  // Auto-save the active waiter's draft on every change
+  useEffect(() => {
+    if (!waiter || restoredFor.current !== waiter.id) return
+    if (cart.length === 0) clearDraft(waiter.id)
+    else saveDraft(waiter.id, { cart, tableId, discount, note, guestId })
+  }, [waiter, cart, tableId, discount, note, guestId])
+
+  // Physical keyboard on the PIN pad: 0-9, Backspace, Enter = unlock, Esc = back
+  useEffect(() => {
+    if (!pinFor || waiter) return
+    const onKey = (e: KeyboardEvent) => {
+      if (pinBusy) return
+      if (/^[0-9]$/.test(e.key)) { e.preventDefault(); tapPin(e.key) }
+      else if (e.key === 'Backspace') { e.preventDefault(); setPinInput(p => p.slice(0, -1)); setPinError('') }
+      else if (e.key === 'Enter') { e.preventDefault(); submitPin() }
+      else if (e.key === 'Escape') { setPinFor(null); setPinInput(''); setPinError('') }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pinFor, waiter, pinBusy, pinInput])
+
+  // The person who is signed in to the system is the one at the till: open straight on THEIR PIN pad
+  // (one time per visit; "Back" still lets another waiter choose their own name).
+  const autoPicked = useRef(false)
+  useEffect(() => {
+    if (autoPicked.current || waiter || pinFor || posStaff.length === 0) return
+    const me = posStaff.find(s => s.is_me && s.has_pin)
+    if (me) { autoPicked.current = true; setPinFor(me); setPinInput(''); setPinError('') }
+  }, [posStaff, waiter, pinFor])
+
+  // "My sales today" — what this waiter has collected so far
+  const [mySales, setMySales] = useState<{ collected: number; orders: number } | null>(null)
+  const loadMySales = useCallback(() => {
+    if (!waiter) { setMySales(null); return }
+    api.get('/restaurant/pos/my-sales', { params: { staff_id: waiter.id } }).then(r => setMySales(r.data.data)).catch(() => undefined)
+  }, [waiter])
+  useEffect(() => { loadMySales() }, [loadMySales, success])
 
   const filtered = useMemo(() => {
     let items = cat === 'all' ? menuItems : menuItems.filter(i => i.category_id === cat)
@@ -255,14 +418,53 @@ export default function POS() {
     }).catch(() => {})
   }
 
+  // True once the server has accepted the first call for the current attempt — after that, a dropped
+  // connection must NOT fall back to the offline outbox (the order would exist twice).
+  const serverHasOrder = useRef(false)
+
+  // Keep the order on this device (outbox) — it is sent automatically when the internet is back
+  const saveOffline = (kind: 'kitchen' | 'pay') => {
+    const entry: OutboxEntry = {
+      id: newClientRef(), kind, created_at: new Date().toISOString(), label: tableLabel,
+      waiter_id: waiter?.id, waiter_name: waiter?.name, total: Math.round(total * 100) / 100,
+      order: {
+        dining_table_id: tableId || null, order_type: tableId ? 'dine_in' : 'takeaway',
+        discount_amount: Math.round(discountAmt * 100) / 100, guest_id: guestId || undefined,
+        lines: cart.map(i => ({ menu_item_id: i.id, quantity: i.qty, special_request: note || undefined })),
+      },
+      pay: kind === 'pay' ? { method: payMethod === 'mobile' ? 'mobile' : payMethod, account_id: accountId } : undefined,
+      status: 'pending',
+      receipt: kind === 'pay' ? 'OFF-' + Date.now().toString(36).toUpperCase().slice(-6) : undefined,
+    }
+    addToOutbox(entry)
+    if (kind === 'kitchen') {
+      printKOT()
+      setSuccess('No internet — order saved on this device and KOT printed. It will reach the kitchen screen when the connection returns.')
+    } else {
+      printReceipt({
+        orderRef: entry.receipt!, items: [...cart], subtotal, discount, discountAmt, tax, total, method: payMethod, paid, change,
+        guest: guests.find(g => g.id === guestId) ? `${guests.find(g => g.id === guestId)!.first_name} ${guests.find(g => g.id === guestId)!.last_name}` : (guestName || undefined),
+        room: roomNumber || undefined,
+      })
+      setPayOpen(false); setAmountPaid(''); setGuestName(''); setRoomNumber(''); setBookingId('')
+      setSuccess('No internet — sale saved on this device and receipt printed. The payment will be recorded when the connection returns.')
+    }
+    setTimeout(() => setSuccess(''), 6000)
+    setOrderNum(n => n + 1)
+    clearCart(); setGuestId('')
+  }
+
   // Create the order + its lines, tracked to the logged-in waiter
-  const createOrderWithLines = async () => {
+  const createOrderWithLines = async (approval: ApprovalBody = {}) => {
     const r = await api.post('/restaurant/orders', {
+      ...approval,
       dining_table_id: tableId || null,
       order_type: tableId ? 'dine_in' : 'takeaway',
       server_staff_id: waiter?.id,
       discount_amount: discountAmt,
+      booking_id: payMethod === 'room_charge' && bookingId ? bookingId : undefined,
     })
+    serverHasOrder.current = true
     const orderId: string = r.data.data.id
     await Promise.all(cart.map(item =>
       api.post(`/restaurant/orders/${orderId}/lines`, {
@@ -278,7 +480,9 @@ export default function POS() {
   const sendToKitchen = async () => {
     if (cart.length === 0 || syncing) return
     setSyncing(true); setError('')
+    serverHasOrder.current = false
     try {
+      if (!navigator.onLine) { saveOffline('kitchen'); return }
       const { orderId, orderRef } = await createOrderWithLines()
       await api.patch(`/restaurant/orders/${orderId}/status`, {
         status: 'sent_to_kitchen', staff_id: waiter?.id,
@@ -292,7 +496,11 @@ export default function POS() {
       setTimeout(() => setSuccess(''), 3000)
       clearCart()
       setGuestId('')
-    } catch (e) { setError(getApiErrorMessage(e)) }
+    } catch (e) {
+      // connection dropped before the server saw anything → keep the order on this device
+      if (isNetworkError(e) && !serverHasOrder.current) saveOffline('kitchen')
+      else setError(getApiErrorMessage(e))
+    }
     finally { setSyncing(false) }
   }
 
@@ -300,13 +508,24 @@ export default function POS() {
   const handlePay = async () => {
     if (cart.length === 0 || (payMethod !== 'room_charge' && !accountId)) return
     setSyncing(true); setError('')
+    serverHasOrder.current = false
     try {
-      const { orderId, orderRef } = await createOrderWithLines()
+      // A discount above the limit needs a manager's PIN BEFORE the order is created
+      const needsApproval = !approvalPolicy.self && discount > 0 && discount > approvalPolicy.limit
+      if (!navigator.onLine) {
+        // Offline: cash/card/mobile sales can wait for the connection; a room charge and a manager-approved discount cannot
+        if (payMethod === 'room_charge') { setError('Room charge needs the internet (it must find the guest in the hotel). Take cash/mobile payment, or wait for the connection.'); return }
+        if (needsApproval) { setError(`A ${discount}% discount needs a manager's PIN, which cannot be checked offline. Lower the discount to ${approvalPolicy.limit}% or less, or wait for the connection.`); return }
+        saveOffline('pay'); return
+      }
+      const { orderId, orderRef } = needsApproval
+        ? await withApproval(body => createOrderWithLines(body), { label: `${discount}% discount (limit without a manager: ${approvalPolicy.limit}%)`, needsPin: true })
+        : await createOrderWithLines()
 
       // 1. Generate the real invoice (starts unpaid/issued)
-      const billRes = await api.post(`/restaurant/orders/${orderId}/bill`, {
-        guest_id: guestId || undefined,
-      })
+      const billRes = await withApproval(body => api.post(`/restaurant/orders/${orderId}/bill`, {
+        guest_id: guestId || undefined, ...body,
+      }))
       const invoice = billRes.data.data
 
       // 2. Record the payment against it → invoice becomes paid, shows in Receipts
@@ -314,6 +533,7 @@ export default function POS() {
         amount: Number(invoice.total_amount),
         payment_method: payMethod === 'mobile' ? 'mobile' : payMethod,
         account_id: payMethod === 'room_charge' ? undefined : accountId,
+        staff_id: waiter?.id,          // the money is recorded under the waiter who collected it
       })
 
       if (tableId) {
@@ -339,9 +559,12 @@ export default function POS() {
       setAmountPaid('')
       setGuestName('')
       setRoomNumber('')
+      setBookingId('')
       setGuestId('')
     } catch (e) {
-      setError(getApiErrorMessage(e))
+      if (isApprovalCancelled(e)) { /* dialog dismissed */ }
+      else if (isNetworkError(e) && !serverHasOrder.current && payMethod !== 'room_charge' && !(!approvalPolicy.self && discount > approvalPolicy.limit)) saveOffline('pay')
+      else setError(getApiErrorMessage(e))
     } finally {
       setSyncing(false)
     }
@@ -357,6 +580,7 @@ export default function POS() {
 
   return (
     <div className="relative flex h-full overflow-hidden bg-neutral-50 dark:bg-[#0f1117]">
+      {waiter && <ReadyAlerts waiterId={waiter.id} />}
 
       {/* ══ WAITER LOCK SCREEN — pick your name, enter your PIN ══ */}
       {!waiter && (
@@ -401,7 +625,7 @@ export default function POS() {
                     {(pinFor.first_name[0] + (pinFor.last_name[0] ?? '')).toUpperCase()}
                   </div>
                   <p className="text-[15px] font-extrabold text-neutral-900 dark:text-white">{pinFor.first_name} {pinFor.last_name}</p>
-                  <p className="text-[12px] text-neutral-400">Enter your PIN</p>
+                  <p className="text-[12px] text-neutral-400">Enter your PIN <span className="text-neutral-300">· keyboard works too</span></p>
                 </div>
 
                 {/* PIN dots */}
@@ -449,6 +673,39 @@ export default function POS() {
       {/* ══ LEFT: Products ══ */}
       <div className="flex flex-1 flex-col overflow-hidden">
 
+        {/* Connection / offline outbox status */}
+        {(!online || outbox.length > 0) && (
+          <div className={`shrink-0 border-b px-4 py-2 ${!online ? 'border-amber-200 bg-amber-50 dark:border-amber-500/20 dark:bg-amber-500/10' : 'border-sky-200 bg-sky-50 dark:border-sky-500/20 dark:bg-sky-500/10'}`}>
+            <div className="flex flex-wrap items-center gap-3 text-[12.5px]">
+              {!online
+                ? <span className="flex items-center gap-1.5 font-bold text-amber-700 dark:text-amber-300"><WifiOff size={14}/> Offline — you can keep taking orders</span>
+                : <span className="flex items-center gap-1.5 font-bold text-sky-700 dark:text-sky-300"><UploadCloud size={14}/> {sending ? 'Sending saved orders…' : 'Saved orders waiting to be sent'}</span>}
+              {outbox.length > 0 && (
+                <button onClick={() => setShowOutbox(s => !s)} className="rounded-full bg-white/70 px-2.5 py-0.5 font-bold text-neutral-700 hover:bg-white dark:bg-white/10 dark:text-neutral-200">
+                  {outbox.length} saved on this device {outbox.some(o => o.status === 'error') && '· needs attention'}
+                </button>)}
+              <div className="flex-1"/>
+              {online && outbox.some(o => o.status === 'pending') && !sending && (
+                <button onClick={() => flushOutbox()} className="rounded-lg bg-sky-600 px-3 py-1 text-[11.5px] font-bold text-white hover:bg-sky-700">Send now</button>)}
+            </div>
+            {showOutbox && outbox.length > 0 && (
+              <ul className="mt-2 space-y-1.5">
+                {outbox.map(o => (
+                  <li key={o.id} className="flex flex-wrap items-center gap-2 rounded-xl bg-white/70 px-3 py-2 text-[12px] dark:bg-white/[0.06]">
+                    <span className={`rounded-full px-2 py-0.5 text-[10.5px] font-bold ${o.kind === 'pay' ? 'bg-emerald-100 text-emerald-700' : 'bg-orange-100 text-orange-700'}`}>{o.kind === 'pay' ? 'Sale' : 'Kitchen'}</span>
+                    <span className="font-semibold text-neutral-700 dark:text-neutral-200">{o.label}</span>
+                    <span className="text-neutral-500">{o.order.lines.reduce((s, l) => s + l.quantity, 0)} items · ${o.total.toFixed(2)} · {new Date(o.created_at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}{o.waiter_name ? ` · ${o.waiter_name}` : ''}</span>
+                    {o.receipt && <span className="font-mono text-[10.5px] text-neutral-400">{o.receipt}</span>}
+                    {o.status === 'error' && (
+                      <span className="flex flex-1 items-center gap-1.5 text-rose-600"><AlertTriangle size={12}/> {o.error}
+                        <button onClick={() => { retryOutboxEntry(o.id); flushOutbox() }} className="ml-auto rounded-md bg-sky-600 px-2 py-0.5 text-[11px] font-bold text-white">Retry</button>
+                        <button onClick={() => { if (window.confirm('Discard this saved order? It will NOT reach the server.')) removeFromOutbox(o.id) }} className="rounded-md bg-rose-100 px-2 py-0.5 text-[11px] font-bold text-rose-700">Discard</button>
+                      </span>)}
+                  </li>))}
+              </ul>)}
+          </div>
+        )}
+
         {/* Top bar */}
         <div className="shrink-0 border-b border-neutral-200/60 bg-white dark:border-white/[0.06] dark:bg-[#1c2333]">
           <div className="flex items-center gap-3 px-4 py-2.5">
@@ -466,6 +723,15 @@ export default function POS() {
                 className="flex-1 bg-transparent text-[13px] text-neutral-800 dark:text-white placeholder-neutral-400 outline-none min-w-0"/>
               {search && <button onClick={() => setSearch('')}><X size={12} className="text-neutral-400"/></button>}
             </div>
+
+            {/* My sales today */}
+            {waiter && mySales && (
+              <div title="Money you have collected today" className="hidden shrink-0 items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-500/25 dark:bg-emerald-500/10 md:flex">
+                <Banknote size={14} className="text-emerald-600"/>
+                <span className="text-[12.5px] font-bold text-emerald-700 dark:text-emerald-300">${mySales.collected.toFixed(2)}</span>
+                <span className="text-[10.5px] text-emerald-600/80">today · {mySales.orders} order{mySales.orders === 1 ? '' : 's'}</span>
+              </div>
+            )}
 
             {/* Active waiter — tap to lock / switch */}
             {waiter && (
@@ -771,13 +1037,17 @@ export default function POS() {
               {/* Room charge fields */}
               {payMethod === 'room_charge' && (
                 <div className="space-y-2 rounded-xl bg-indigo-50 dark:bg-indigo-500/10 p-3">
-                  <p className="text-[11px] font-semibold text-indigo-700 dark:text-indigo-400">Room Charge Details</p>
-                  <input value={guestName} onChange={e => setGuestName(e.target.value)}
-                    placeholder="Guest Name"
-                    className="w-full rounded-lg border border-indigo-200 bg-white px-3 py-1.5 text-[12px] outline-none dark:border-indigo-500/20 dark:bg-white/[0.04] dark:text-white"/>
-                  <input value={roomNumber} onChange={e => setRoomNumber(e.target.value)}
-                    placeholder="Room Number"
-                    className="w-full rounded-lg border border-indigo-200 bg-white px-3 py-1.5 text-[12px] outline-none dark:border-indigo-500/20 dark:bg-white/[0.04] dark:text-white"/>
+                  <p className="text-[11px] font-semibold text-indigo-700 dark:text-indigo-400">Charge to a checked-in guest</p>
+                  <select value={bookingId} onChange={e => pickBooking(e.target.value)}
+                    className="w-full rounded-lg border border-indigo-200 bg-white px-3 py-2 text-[12px] outline-none dark:border-indigo-500/20 dark:bg-[#1c2333] dark:text-white">
+                    <option value="">— Select room / guest —</option>
+                    {inHouse.map(b => (
+                      <option key={b.id} value={b.id}>Room {b.room_number} · {b.guest_name} ({b.booking_ref})</option>
+                    ))}
+                  </select>
+                  {inHouse.length === 0 && (
+                    <p className="text-[11px] text-indigo-600/80 dark:text-indigo-300/70">No guests are checked in right now.</p>
+                  )}
                 </div>
               )}
 
@@ -819,7 +1089,7 @@ export default function POS() {
                 disabled={
                   syncing ||
                   (payMethod === 'cash' && paid < total) ||
-                  (payMethod === 'room_charge' && (!guestName.trim() || !roomNumber.trim())) ||
+                  (payMethod === 'room_charge' && !bookingId) ||
                   (payMethod !== 'room_charge' && !accountId)
                 }
                 className="w-full rounded-xl bg-orange-500 py-3.5 text-[14px] font-extrabold text-white shadow-sm hover:bg-orange-600 disabled:cursor-not-allowed disabled:opacity-40 transition-colors">

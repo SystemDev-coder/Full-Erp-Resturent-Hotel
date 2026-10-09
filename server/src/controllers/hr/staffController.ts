@@ -23,7 +23,14 @@ export async function listStaff(req: Request, res: Response) {
 }
 
 export async function getStaff(req: Request, res: Response) {
-  const { rows } = await query(`SELECT * FROM staff WHERE id = $1 AND deleted_at IS NULL`, [req.params.id])
+  // Explicit columns - never SELECT * here: it would return the POS PIN hash
+  const { rows } = await query(
+    `SELECT id, branch_id, department_id, employee_id, first_name, last_name, email, phone, role,
+            employment_type, basic_salary, joined_at, left_at, is_active, notes, created_at, updated_at,
+            (pos_pin IS NOT NULL) AS has_pin
+     FROM staff WHERE id = $1 AND branch_id = $2 AND deleted_at IS NULL`,
+    [req.params.id, req.auth!.branchId]
+  )
   if (!rows[0]) return res.status(404).json({ success: false, message: 'Staff not found' })
   return res.json({ success: true, data: rows[0] })
 }
@@ -38,6 +45,10 @@ export async function createStaff(req: Request, res: Response) {
 
   if (!first_name || !last_name || !role) {
     return res.status(400).json({ success: false, message: 'first_name, last_name and role are required' })
+  }
+
+  if (!Number.isFinite(Number(basic_salary)) || Number(basic_salary) < 0) {
+    return res.status(400).json({ success: false, message: 'basic_salary cannot be negative' })
   }
 
   const empId = employee_id || ('EMP-' + Date.now().toString(36).toUpperCase())
@@ -61,6 +72,9 @@ export async function updateStaff(req: Request, res: Response) {
     department_id, first_name, last_name, email, phone,
     role, employment_type, basic_salary, notes,
   } = req.body
+  if (basic_salary !== undefined && basic_salary !== null && (!Number.isFinite(Number(basic_salary)) || Number(basic_salary) < 0)) {
+    return res.status(400).json({ success: false, message: 'basic_salary cannot be negative' })
+  }
 
   const { rows } = await query(
     `UPDATE staff SET
@@ -74,27 +88,27 @@ export async function updateStaff(req: Request, res: Response) {
        basic_salary    = COALESCE($8, basic_salary),
        notes           = COALESCE($9, notes),
        updated_at      = NOW()
-     WHERE id = $10 AND deleted_at IS NULL
+     WHERE id = $10 AND branch_id = $11 AND deleted_at IS NULL
      RETURNING id, employee_id, first_name, last_name, role, basic_salary`,
     [department_id ?? null, first_name ?? null, last_name ?? null,
      email ?? null, phone ?? null, role ?? null, employment_type ?? null,
-     basic_salary ?? null, notes ?? null, id]
+     basic_salary ?? null, notes ?? null, id, req.auth!.branchId]
   )
   if (!rows[0]) return res.status(404).json({ success: false, message: 'Staff not found' })
   return res.json({ success: true, data: rows[0] })
 }
 
-export async function deactivateStaff(req: Request, res: Response) {
-  await query(`UPDATE staff SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [req.params.id])
+async function setStaffState(req: Request, res: Response, sql: string) {
+  const { rows } = await query(sql, [req.params.id, req.auth!.branchId])
+  if (!rows[0]) return res.status(404).json({ success: false, message: 'Staff not found' })
   return res.json({ success: true })
 }
 
-export async function activateStaff(req: Request, res: Response) {
-  await query(`UPDATE staff SET is_active = TRUE, left_at = NULL, updated_at = NOW() WHERE id = $1`, [req.params.id])
-  return res.json({ success: true })
-}
+export const deactivateStaff = (req: Request, res: Response) => setStaffState(req, res,
+  `UPDATE staff SET is_active = FALSE, updated_at = NOW() WHERE id = $1 AND branch_id = $2 AND deleted_at IS NULL RETURNING id`)
 
-export async function deleteStaff(req: Request, res: Response) {
-  await query(`UPDATE staff SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1`, [req.params.id])
-  return res.json({ success: true })
-}
+export const activateStaff = (req: Request, res: Response) => setStaffState(req, res,
+  `UPDATE staff SET is_active = TRUE, left_at = NULL, updated_at = NOW() WHERE id = $1 AND branch_id = $2 AND deleted_at IS NULL RETURNING id`)
+
+export const deleteStaff = (req: Request, res: Response) => setStaffState(req, res,
+  `UPDATE staff SET deleted_at = NOW(), is_active = FALSE, updated_at = NOW() WHERE id = $1 AND branch_id = $2 AND deleted_at IS NULL RETURNING id`)

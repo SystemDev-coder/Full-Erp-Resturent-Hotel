@@ -167,3 +167,22 @@ select {
   appearance: none;
   -webkit-appearance: none;
 }
+
+
+/* ── Theme switch animation ─────────────────────────────────────────────────── */
+/* View Transitions API: old and new page snapshots are layered, the new one is revealed by the
+   circle animation set up in ThemeContext (no built-in cross-fade, so the reveal is crisp). */
+::view-transition-old(root),
+::view-transition-new(root) { animation: none; mix-blend-mode: normal; }
+::view-transition-old(root) { z-index: 1; }
+::view-transition-new(root) { z-index: 2147483646; }
+
+/* Fallback for browsers without View Transitions: every surface eases between themes */
+.theme-anim, .theme-anim *, .theme-anim *::before, .theme-anim *::after {
+  transition: background-color .5s ease, color .5s ease, border-color .5s ease,
+              fill .5s ease, stroke .5s ease, box-shadow .5s ease, opacity .5s ease !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none !important; }
+}

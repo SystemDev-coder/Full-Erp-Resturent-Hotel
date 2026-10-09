@@ -1,5 +1,5 @@
-import { Router } from 'express'
-import { requireAuth } from '../middleware/auth'
+import { safeRouter } from '../utils/safeRouter'
+import { requireAuth, requireModule } from '../middleware/auth'
 import { enforceModulePermission } from '../middleware/permissions'
 import {
   listStaff, getStaff, createStaff, updateStaff,
@@ -14,8 +14,9 @@ import {
   getPayrollLines,
 } from '../controllers/hr/departmentController'
 
-export const hrRouter = Router()
+export const hrRouter = safeRouter()
 hrRouter.use(requireAuth)
+hrRouter.use(requireModule('hr'))
 hrRouter.use(enforceModulePermission('hr'))
 
 // ── Departments ───────────────────────────────────────────────────────────────

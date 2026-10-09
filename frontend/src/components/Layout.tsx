@@ -1,9 +1,9 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   LayoutDashboard, BedDouble, CalendarCheck, Users, DoorOpen, SprayCan,
-  UtensilsCrossed, ClipboardList, BookOpenCheck, Monitor,
+  UtensilsCrossed, ClipboardList, BookOpenCheck, Monitor, ChefHat, ClipboardCheck,
   ShoppingCart, Archive,
   Landmark,
   UserSquare2, Wallet,
@@ -12,13 +12,16 @@ import {
   ChevronDown, LogOut, Building2, Boxes, Check,
   ChevronRight, RefreshCw, Truck, Warehouse,
   Receipt, Flame, Banknote, BarChart3,
-  FileText, AlertTriangle, CornerDownLeft,
+  FileText, AlertTriangle, CornerDownLeft, PanelLeftClose, PanelLeftOpen, Lock, ShieldCheck,
 } from 'lucide-react'
 import api from '@/services/api'
 import { useAuth } from '@hooks/useAuth'
 import { useTheme } from '@contexts/ThemeContext'
 import { useLanguage } from '@contexts/LanguageContext'
 import { LangPicker } from '@/components/ui/LangPicker'
+import { SystemLockScreen } from '@/components/SystemLockScreen'
+import { TwoFactorModal } from '@/components/TwoFactorModal'
+import { ReadyAlerts } from '@/components/ReadyAlerts'
 import { ROLE_LABELS, ROLE_COLORS } from '@/types/auth'
 import type { User, UserBranch, BranchType, ERPRole } from '@/types/auth'
 
@@ -47,6 +50,7 @@ const RESTAURANT_SECTION: NavSection = {
   items: [
     { path: '/restaurant/pos',        label: 'nav.pos',          icon: <Monitor size={14} /> },
     { path: '/restaurant/operations', label: 'nav.ordersTables', icon: <ClipboardList size={14} /> },
+    { path: '/restaurant/kitchen',    label: 'nav.kitchen',      icon: <ChefHat size={14} /> },
     // Only managers touch the menu itself (prices, photos)
     { path: '/restaurant/menu',       label: 'nav.menu',         icon: <BookOpenCheck size={14} />, roles: MANAGERS },
   ],
@@ -59,6 +63,7 @@ const INVENTORY_SECTION: NavSection = {
     { path: '/inventory/suppliers',  label: 'nav.suppliers',      icon: <Truck size={14} />, roles: [...MANAGERS, 'inventory_manager'] },
     { path: '/inventory/warehouses', label: 'nav.warehouses',     icon: <Warehouse size={14} />, roles: [...MANAGERS, 'inventory_manager'] },
     { path: '/inventory/items',      label: 'nav.items',          icon: <Archive size={14} /> },
+    { path: '/inventory/stock-control', label: 'nav.stockControl', icon: <ClipboardCheck size={14} />, roles: [...MANAGERS, 'inventory_manager'] },
     { path: '/inventory/orders',     label: 'nav.purchaseOrders', icon: <ShoppingCart size={14} />, roles: [...MANAGERS, 'inventory_manager'] },
   ],
 }
@@ -111,13 +116,17 @@ const lastSegment = (path: string) => path.split('/').filter(Boolean).pop() ?? '
 // individual page within it on top of that — hotel staff never see
 // restaurant menus, restaurant staff never see hotel, and an admin can hide
 // e.g. just "Rooms" for one receptionist without touching their role.
-function visibleSectionsFor(branchType?: BranchType, role?: ERPRole, perms?: MyPermissions | null): NavSection[] {
+// Nav section key → module key used by Systems → Modules
+const MODULE_OF_SECTION: Record<string, string> = { finance: 'accounting' }
+
+function visibleSectionsFor(branchType?: BranchType, role?: ERPRole, perms?: MyPermissions | null, disabledModules: Set<string> = new Set()): NavSection[] {
   const roleAllows = (roles?: ERPRole[]) => !roles || !role || roles.includes(role)
   return ALL_SECTIONS
     .filter(s => {
       if (s.key === 'hotel'      && branchType === 'restaurant') return false
       if (s.key === 'restaurant' && branchType === 'hotel')      return false
       if (perms && perms.modules[s.key]?.view === false) return false
+      if (disabledModules.has(MODULE_OF_SECTION[s.key] ?? s.key)) return false   // switched off in Systems → Modules
       return roleAllows(s.roles)
     })
     .map(s => ({
@@ -136,7 +145,8 @@ function visibleSectionsFor(branchType?: BranchType, role?: ERPRole, perms?: MyP
 const SEGMENT_KEY: Record<string, string> = {
   dashboard: 'nav.dashboard', hotel: 'nav.hotel', bookings: 'nav.bookings',
   rooms: 'nav.rooms', guests: 'nav.guests', housekeeping: 'nav.housekeeping',
-  restaurant: 'nav.restaurant', pos: 'nav.pos', operations: 'nav.ordersTables',
+  restaurant: 'nav.restaurant', pos: 'nav.pos', operations: 'nav.ordersTables', kitchen: 'nav.kitchen',
+  'stock-control': 'nav.stockControl',
   orders: 'nav.orders', tables: 'nav.tables', menu: 'nav.menu',
   inventory: 'nav.inventory', suppliers: 'nav.suppliers', warehouses: 'nav.warehouses',
   items: 'nav.items', stock: 'nav.stock',
@@ -185,37 +195,110 @@ const NOTIF_ICON: Record<Notif['kind'], { icon: React.ReactNode; cls: string }> 
 
 // ─── Flat nav item ────────────────────────────────────────────────────────────
 
-function NavLinkItem({ path, label, icon, onClose }: NavItem & { onClose: () => void }) {
+function NavLinkItem({ path, label, icon, onClose, collapsed }: NavItem & { onClose: () => void; collapsed: boolean }) {
   const { pathname } = useLocation()
   const { t } = useLanguage()
   const active = pathname === path || pathname.startsWith(path + '/')
   return (
-    <Link to={path} onClick={onClose}
-      className={`relative flex items-center gap-3 rounded-lg px-3 py-[7px] text-[12.5px] font-medium transition-all group ${
-        active ? 'bg-white/[0.08] text-white' : 'text-[#8888aa] hover:bg-white/[0.04] hover:text-white'
+    <Link to={path} onClick={onClose} title={collapsed ? t(label) : undefined}
+      className={`relative flex items-center rounded-lg py-[7px] text-[12.5px] font-medium transition-all group ${
+        collapsed ? 'justify-center px-0' : 'gap-3 px-3'
+      } ${
+        active ? 'bg-indigo-50 text-indigo-700 dark:bg-white/[0.08] dark:text-white' : 'text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900 dark:text-[#8888aa] dark:hover:bg-white/[0.04] dark:hover:text-white'
       }`}
     >
       {active && <span className="absolute left-0 top-1/2 -translate-y-1/2 h-5 w-[3px] rounded-r-full bg-indigo-400" />}
-      <span className={`shrink-0 transition-colors ${active ? 'text-indigo-400' : 'text-[#55557a] group-hover:text-[#8888aa]'}`}>
+      <span className={`shrink-0 transition-colors ${active ? 'text-indigo-600 dark:text-indigo-400' : 'text-neutral-400 group-hover:text-neutral-600 dark:text-[#55557a] dark:group-hover:text-[#8888aa]'}`}>
         {icon}
       </span>
-      {t(label)}
+      {!collapsed && t(label)}
     </Link>
   )
 }
 
 // ─── Flat section (no collapse) ───────────────────────────────────────────────
 
-function NavSection({ section, onClose }: { section: NavSection; onClose: () => void }) {
+// ─── Icon-rail section with hover flyout ──────────────────────────────────────
+// In the collapsed sidebar a section is ONE icon; hovering (or tapping) it opens
+// a flyout card to the right listing the section's pages. The flyout is
+// position:fixed because the <nav> scrolls (overflow would clip an absolute one).
+
+function RailSection({ section, onClose }: { section: NavSection; onClose: () => void }) {
+  const { pathname } = useLocation()
+  const { t } = useLanguage()
+  const btnRef   = useRef<HTMLButtonElement>(null)
+  const timerRef = useRef<ReturnType<typeof setTimeout>>()
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+  const hasActive = section.items.some(i => pathname === i.path || pathname.startsWith(i.path + '/'))
+
+  const open = () => {
+    clearTimeout(timerRef.current)
+    const r = btnRef.current?.getBoundingClientRect()
+    if (r) setPos({ top: r.top, left: r.right })
+  }
+  // Short delay so the pointer can cross the gap between icon and flyout
+  const scheduleClose = () => {
+    clearTimeout(timerRef.current)
+    timerRef.current = setTimeout(() => setPos(null), 140)
+  }
+  useEffect(() => () => clearTimeout(timerRef.current), [])
+  // Close when the route changes
+  useEffect(() => { setPos(null) }, [pathname])
+
+  const icon = React.isValidElement(section.icon)
+    ? React.cloneElement(section.icon as React.ReactElement<{ size?: number }>, { size: 18 })
+    : section.icon
+
+  return (
+    <div className="mb-1.5" onMouseEnter={open} onMouseLeave={scheduleClose}>
+      <button ref={btnRef} type="button" onClick={() => (pos ? setPos(null) : open())}
+        aria-label={t(section.label)} aria-expanded={!!pos}
+        className={`relative mx-auto flex h-10 w-10 items-center justify-center rounded-xl transition-colors ${
+          hasActive ? 'bg-indigo-50 dark:bg-white/[0.10]' : pos ? 'bg-neutral-100 dark:bg-white/[0.07]' : 'hover:bg-neutral-100 dark:hover:bg-white/[0.06]'
+        }`}>
+        {hasActive && <span className="absolute -left-2 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-r-full bg-indigo-400" />}
+        <span className={section.color}>{icon}</span>
+        <ChevronRight size={9} className="absolute bottom-1 right-1 text-neutral-400 dark:text-[#55557a]" />
+      </button>
+
+      {pos && (
+        <div className="fixed z-[80] pl-2" style={{ top: pos.top, left: pos.left }}
+          onMouseEnter={open} onMouseLeave={scheduleClose}>
+          <div className="min-w-[200px] rounded-2xl border border-neutral-200 bg-white p-2 shadow-2xl shadow-black/10 dark:border-white/[0.08] dark:bg-[#22223b] dark:shadow-black/40">
+            <p className="px-3 pb-1.5 pt-1 text-[10px] font-bold uppercase tracking-widest text-neutral-400 dark:text-[#8888aa]">{t(section.label)}</p>
+            <div className="space-y-0.5">
+              {section.items.map(item => {
+                const active = pathname === item.path || pathname.startsWith(item.path + '/')
+                return (
+                  <Link key={item.path} to={item.path} onClick={() => { setPos(null); onClose() }}
+                    className={`flex items-center gap-3 rounded-lg px-3 py-2 text-[12.5px] font-medium transition-colors ${
+                      active ? 'bg-indigo-50 text-indigo-700 dark:bg-white/[0.10] dark:text-white' : 'text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900 dark:text-[#b4b4cc] dark:hover:bg-white/[0.06] dark:hover:text-white'
+                    }`}>
+                    <span className={active ? 'text-indigo-600 dark:text-indigo-400' : 'text-neutral-400 dark:text-[#6b6b90]'}>{item.icon}</span>
+                    {t(item.label)}
+                  </Link>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function NavSection({ section, onClose, collapsed }: { section: NavSection; onClose: () => void; collapsed: boolean }) {
   const { pathname } = useLocation()
   const { t } = useLanguage()
   const hasActive = section.items.some(i => pathname === i.path || pathname.startsWith(i.path + '/'))
+
+  if (collapsed) return <RailSection section={section} onClose={onClose} />
 
   return (
     <div className="mb-3">
       {/* Section label — NOT a button, just a label */}
       <div className={`flex items-center gap-2 px-3 py-1.5 text-[10.5px] font-bold uppercase tracking-widest mb-1 ${
-        hasActive ? 'text-white' : 'text-[#44445a]'
+        hasActive ? 'text-neutral-900 dark:text-white' : 'text-neutral-400 dark:text-[#44445a]'
       }`}>
         <span className={section.color}>{section.icon}</span>
         {t(section.label)}
@@ -223,7 +306,7 @@ function NavSection({ section, onClose }: { section: NavSection; onClose: () => 
       {/* Items always visible */}
       <div className="space-y-0.5">
         {section.items.map(item => (
-          <NavLinkItem key={item.path} {...item} onClose={onClose} />
+          <NavLinkItem key={item.path} {...item} onClose={onClose} collapsed={false} />
         ))}
       </div>
     </div>
@@ -421,11 +504,74 @@ export const Layout = () => {
   const [notifOpen,    setNotifOpen]    = useState(false)
   const [signOutOpen,  setSignOutOpen]  = useState(false)
   const [avatarOpen,   setAvatarOpen]   = useState(false)
+  const [twoFactorOpen, setTwoFactorOpen] = useState(false)
+  // Desktop sidebar can shrink to an icon rail; the choice survives reloads.
+  const [collapsed, setCollapsed] = useState(() => {
+    try { return localStorage.getItem('sidebar_collapsed') === '1' } catch { return false }
+  })
+  const toggleCollapsed = () => setCollapsed(v => {
+    const next = !v
+    try { localStorage.setItem('sidebar_collapsed', next ? '1' : '0') } catch { /* private mode */ }
+    return next
+  })
   const { pathname } = useLocation()
   const navigate = useNavigate()
   const { user, logout } = useAuth()
   const { theme, toggleTheme } = useTheme()
   const { t } = useLanguage()
+
+  // ── Screen lock ────────────────────────────────────────────────────────────
+  // Password-protected lock for the main app. The restaurant POS has its own,
+  // separate PIN lock (waiter/cashier identity at a shared till) — see POS.tsx.
+  // Floor roles (waiter, cashier, chef, bar) are exempt from the *idle* auto-lock:
+  // their Orders & Tables / kitchen screens sit untouched by design.
+  const LOCK_KEY     = 'system_lock_user'
+  const IDLE_MINUTES = 10
+  const lockRole     = user?.current_branch?.role ?? user?.role
+  const autoLock     = !!lockRole && !['waiter', 'cashier', 'chef', 'bar_staff'].includes(lockRole)
+  const [lockInfo, setLockInfo] = useState<null | { idle: boolean }>(() => {
+    try { return user && localStorage.getItem(LOCK_KEY) === user.id ? { idle: false } : null } catch { return null }
+  })
+  const lastActive = useRef(Date.now())
+
+  const lockScreen = useCallback((idle = false) => {
+    if (!user) return
+    try { localStorage.setItem(LOCK_KEY, user.id) } catch { /* storage unavailable */ }
+    setLockInfo({ idle })
+    api.post('/auth/lock').catch(() => {})
+  }, [user])
+
+  const unlockScreen = () => {
+    try { localStorage.removeItem(LOCK_KEY) } catch { /* storage unavailable */ }
+    lastActive.current = Date.now()
+    setLockInfo(null)
+  }
+
+  // Inactivity watcher
+  useEffect(() => {
+    if (lockInfo || !autoLock) return
+    const bump = () => { lastActive.current = Date.now() }
+    const events = ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll', 'wheel'] as const
+    events.forEach(e => window.addEventListener(e, bump, { passive: true }))
+    const timer = setInterval(() => {
+      if (Date.now() - lastActive.current >= IDLE_MINUTES * 60_000) lockScreen(true)
+    }, 15_000)
+    return () => {
+      events.forEach(e => window.removeEventListener(e, bump))
+      clearInterval(timer)
+    }
+  }, [lockInfo, autoLock, lockScreen])
+
+  // Keep several open tabs in step: lock one, they all lock; unlock one, they all unlock
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== LOCK_KEY) return
+      if (e.newValue && e.newValue === user?.id) setLockInfo(l => l ?? { idle: false })
+      else if (!e.newValue) setLockInfo(null)
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [user?.id])
 
   // Per-user permission overrides (Settings → Permissions) — fetched once per
   // session; org_admin has no override rows so this naturally resolves to
@@ -437,12 +583,21 @@ export const Layout = () => {
       .catch(() => setMyPerms(null))
   }, [])
 
+  // Modules an admin switched off for this branch (Systems → Modules) disappear from the menu
+  const [disabledModules, setDisabledModules] = useState<Set<string>>(new Set())
+  useEffect(() => {
+    api.get('/system/modules')
+      .then(r => setDisabledModules(new Set((r.data.data as { key: string; is_enabled: boolean }[]).filter(m => !m.is_enabled).map(m => m.key))))
+      .catch(() => setDisabledModules(new Set()))
+  }, [user?.current_branch?.branch_id])
+
   // Only show modules relevant to the active branch type, the user's role,
   // and any per-user permission override
   const visibleSections = visibleSectionsFor(
     user?.current_branch?.branch_type,
     user?.current_branch?.role ?? user?.role,
     myPerms,
+    disabledModules,
   )
 
   // ── Real notifications (refreshed every minute) ─────────────────────────────
@@ -515,71 +670,98 @@ export const Layout = () => {
   }))
 
   // ── Sidebar ────────────────────────────────────────────────────────────────
-  const Sidebar = (
-    <aside className="flex h-full w-[252px] flex-col bg-[#1a1a2e] border-r border-white/[0.05]">
+  // `rail` = icon-only mode (desktop only; the mobile drawer is always full width)
+  const renderSidebar = (rail: boolean) => (
+    <aside className={`flex h-full flex-col border-r border-neutral-200/80 bg-white transition-[width,background-color,border-color] duration-200 dark:border-white/[0.05] dark:bg-[#1a1a2e] ${
+      rail ? 'w-[72px]' : 'w-[252px]'
+    }`}>
 
       {/* Logo */}
-      <div className="flex h-16 shrink-0 items-center gap-3 border-b border-white/[0.06] px-4">
-        <Link to="/dashboard" className="flex items-center gap-3" onClick={() => setMobileOpen(false)}>
+      <div className={`flex h-16 shrink-0 items-center border-b border-neutral-200/80 dark:border-white/[0.06] ${rail ? 'justify-center px-0' : 'gap-3 px-4'}`}>
+        <Link to="/dashboard" className="flex items-center gap-3" onClick={() => setMobileOpen(false)}
+          title={rail ? 'Hospitality ERP' : undefined}>
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 shadow-lg shadow-indigo-500/25">
             <Building2 size={17} className="text-white" />
           </div>
-          <div className="leading-none">
-            <p className="text-[14px] font-extrabold tracking-tight text-white">
-              Hospitality<span className="text-indigo-400"> ERP</span>
-            </p>
-            <p className="mt-0.5 text-[9px] font-semibold uppercase tracking-widest text-[#55557a]">
-              {user?.organization_name ?? 'Management System'}
-            </p>
-          </div>
+          {!rail && (
+            <div className="leading-none">
+              <p className="text-[14px] font-extrabold tracking-tight text-neutral-900 dark:text-white">
+                Hospitality<span className="text-indigo-400"> ERP</span>
+              </p>
+              <p className="mt-0.5 text-[9px] font-semibold uppercase tracking-widest text-neutral-400 dark:text-[#55557a]">
+                {user?.organization_name ?? 'Management System'}
+              </p>
+            </div>
+          )}
         </Link>
-        <button onClick={() => setMobileOpen(false)} className="ml-auto shrink-0 p-1 text-[#55557a] hover:text-white lg:hidden">
+        <button onClick={() => setMobileOpen(false)} className="ml-auto shrink-0 p-1 text-neutral-400 hover:text-neutral-800 dark:text-[#55557a] dark:hover:text-white lg:hidden">
           <X size={16} />
         </button>
       </div>
 
       {/* Nav */}
-      <nav className="flex-1 overflow-y-auto px-3 py-4">
+      <nav className={`flex-1 overflow-y-auto py-4 ${rail ? 'px-2' : 'px-3'}`}>
         {/* Dashboard */}
-        <Link to="/dashboard" onClick={() => setMobileOpen(false)}
-          className={`relative mb-4 flex items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] font-semibold transition-all group ${
-            pathname === '/dashboard' ? 'bg-indigo-500/20 text-white' : 'text-[#8888aa] hover:bg-white/[0.04] hover:text-white'
+        <Link to="/dashboard" onClick={() => setMobileOpen(false)} title={rail ? t('nav.dashboard') : undefined}
+          className={`relative mb-4 flex items-center rounded-lg py-2.5 text-[13px] font-semibold transition-all group ${
+            rail ? 'justify-center px-0' : 'gap-3 px-3'
+          } ${
+            pathname === '/dashboard' ? 'bg-indigo-50 text-indigo-700 dark:bg-indigo-500/20 dark:text-white' : 'text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900 dark:text-[#8888aa] dark:hover:bg-white/[0.04] dark:hover:text-white'
           }`}
         >
           {pathname === '/dashboard' && <span className="absolute left-0 top-1/2 -translate-y-1/2 h-5 w-[3px] rounded-r-full bg-indigo-400" />}
-          <LayoutDashboard size={15} className={pathname === '/dashboard' ? 'text-indigo-400' : 'text-[#55557a] group-hover:text-[#8888aa]'} />
-          {t('nav.dashboard')}
-          {pathname === '/dashboard' && <span className="ml-auto h-1.5 w-1.5 rounded-full bg-indigo-400" />}
+          <LayoutDashboard size={15} className={pathname === '/dashboard' ? 'text-indigo-600 dark:text-indigo-400' : 'text-neutral-400 group-hover:text-neutral-600 dark:text-[#55557a] dark:group-hover:text-[#8888aa]'} />
+          {!rail && t('nav.dashboard')}
+          {!rail && pathname === '/dashboard' && <span className="ml-auto h-1.5 w-1.5 rounded-full bg-indigo-400" />}
         </Link>
 
-        <div className="mb-3 h-px bg-white/[0.05]" />
+        <div className="mb-3 h-px bg-neutral-200/80 dark:bg-white/[0.05]" />
 
         {visibleSections.map(s => (
-          <NavSection key={s.key} section={s} onClose={() => setMobileOpen(false)} />
+          <NavSection key={s.key} section={s} onClose={() => setMobileOpen(false)} collapsed={rail} />
         ))}
       </nav>
 
       {/* User footer */}
-      <div className="shrink-0 border-t border-white/[0.06] p-3">
-        <div className="flex items-center gap-2.5 rounded-xl px-3 py-2.5">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-[12px] font-extrabold text-white shadow">
-            {initials(user)}
+      <div className={`shrink-0 border-t border-neutral-200/80 dark:border-white/[0.06] ${rail ? 'p-2' : 'p-3'}`}>
+        {rail ? (
+          <div className="flex flex-col items-center gap-1.5">
+            <div title={`${displayName(user)} · ${roleLabel(user)}`}
+              className="flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-[12px] font-extrabold text-white shadow">
+              {initials(user)}
+            </div>
+            <button onClick={(e) => toggleTheme({ x: e.clientX, y: e.clientY })} aria-label="Toggle theme" title="Toggle theme"
+              className="flex h-8 w-8 items-center justify-center rounded-lg text-neutral-400 hover:bg-neutral-100 hover:text-neutral-800 dark:text-[#55557a] dark:hover:bg-white/10 dark:hover:text-white transition-colors">
+              {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
+            </button>
+            <button onClick={() => setSignOutOpen(true)} aria-label={t('signout.title')} title={t('signout.title')}
+              className="flex h-8 w-8 items-center justify-center rounded-lg text-neutral-500 dark:text-[#8888aa] transition-colors hover:bg-red-500/10 hover:text-red-500 dark:hover:text-red-400">
+              <LogOut size={14} />
+            </button>
           </div>
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-[12.5px] font-semibold text-white leading-tight">{displayName(user)}</p>
-            <span className={`mt-0.5 inline-block rounded px-1.5 py-0.5 text-[9.5px] font-bold ${roleColor(user)}`}>
-              {roleLabel(user)}
-            </span>
-          </div>
-          <button onClick={toggleTheme} aria-label="Toggle theme"
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[#55557a] hover:bg-white/10 hover:text-white transition-colors">
-            {theme === 'dark' ? <Sun size={13} /> : <Moon size={13} />}
-          </button>
-        </div>
-        <button onClick={() => setSignOutOpen(true)}
-          className="mt-1 flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] font-medium text-[#8888aa] transition-colors hover:bg-red-500/10 hover:text-red-400">
-          <LogOut size={14} /> {t('signout.title')}
-        </button>
+        ) : (
+          <>
+            <div className="flex items-center gap-2.5 rounded-xl px-3 py-2.5">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-[12px] font-extrabold text-white shadow">
+                {initials(user)}
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-[12.5px] font-semibold text-neutral-900 dark:text-white leading-tight">{displayName(user)}</p>
+                <span className={`mt-0.5 inline-block rounded px-1.5 py-0.5 text-[9.5px] font-bold ${roleColor(user)}`}>
+                  {roleLabel(user)}
+                </span>
+              </div>
+              <button onClick={(e) => toggleTheme({ x: e.clientX, y: e.clientY })} aria-label="Toggle theme"
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-neutral-400 hover:bg-neutral-100 hover:text-neutral-800 dark:text-[#55557a] dark:hover:bg-white/10 dark:hover:text-white transition-colors">
+                {theme === 'dark' ? <Sun size={13} /> : <Moon size={13} />}
+              </button>
+            </div>
+            <button onClick={() => setSignOutOpen(true)}
+              className="mt-1 flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] font-medium text-neutral-500 dark:text-[#8888aa] transition-colors hover:bg-red-500/10 hover:text-red-500 dark:hover:text-red-400">
+              <LogOut size={14} /> {t('signout.title')}
+            </button>
+          </>
+        )}
       </div>
     </aside>
   )
@@ -598,7 +780,7 @@ export const Layout = () => {
       </AnimatePresence>
 
       {/* Desktop sidebar */}
-      <div className="hidden lg:block shrink-0">{Sidebar}</div>
+      <div className="hidden lg:block shrink-0">{renderSidebar(collapsed)}</div>
 
       {/* Mobile sidebar */}
       <AnimatePresence>
@@ -606,7 +788,7 @@ export const Layout = () => {
           <motion.div initial={{ x: -252 }} animate={{ x: 0 }} exit={{ x: -252 }}
             transition={{ type: 'spring', stiffness: 400, damping: 35 }}
             className="fixed inset-y-0 left-0 z-50 lg:hidden">
-            {Sidebar}
+            {renderSidebar(false)}
           </motion.div>
         )}
       </AnimatePresence>
@@ -621,6 +803,14 @@ export const Layout = () => {
           <button onClick={() => setMobileOpen(true)}
             className="flex h-9 w-9 items-center justify-center rounded-lg text-neutral-500 hover:bg-neutral-100 dark:hover:bg-white/[0.06] lg:hidden">
             <Menu size={18} />
+          </button>
+
+          {/* Desktop: collapse / expand the sidebar */}
+          <button onClick={toggleCollapsed}
+            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            className="hidden h-9 w-9 items-center justify-center rounded-lg text-neutral-500 hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-white/[0.06] lg:flex">
+            {collapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
           </button>
 
           {/* Breadcrumb */}
@@ -651,6 +841,12 @@ export const Layout = () => {
 
             {/* Divider between context and tools */}
             <span className="mx-0.5 hidden h-6 w-px bg-neutral-200 dark:bg-white/[0.08] md:block" aria-hidden/>
+
+            {/* Lock screen — password protected, page state is kept */}
+            <button onClick={() => lockScreen(false)} aria-label="Lock screen" title="Lock screen"
+              className="flex h-9 w-9 items-center justify-center rounded-xl border border-neutral-200/60 bg-neutral-50 text-neutral-500 hover:border-amber-300 hover:text-amber-600 dark:border-white/[0.07] dark:bg-white/[0.04] dark:text-neutral-400 dark:hover:border-amber-500/40 dark:hover:text-amber-400 transition-colors">
+              <Lock size={15} />
+            </button>
 
             {/* Group 2: tools (search + notifications) */}
             <button aria-label={t('common.search')} onClick={() => setSearchOpen(true)} title="Search (Ctrl+K)"
@@ -744,10 +940,14 @@ export const Layout = () => {
                           )}
                         </div>
                       </div>
-                      <button onClick={() => { setAvatarOpen(false); toggleTheme() }}
+                      <button onClick={(e) => { setAvatarOpen(false); toggleTheme({ x: e.clientX, y: e.clientY }) }}
                         className="flex w-full items-center gap-2.5 px-4 py-2.5 text-[12.5px] font-medium text-neutral-600 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-white/[0.04] transition-colors">
                         {theme === 'dark' ? <Sun size={14}/> : <Moon size={14}/>}
                         {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+                      </button>
+                      <button onClick={() => { setAvatarOpen(false); setTwoFactorOpen(true) }}
+                        className="flex w-full items-center gap-2.5 px-4 py-2.5 text-[12.5px] font-medium text-neutral-600 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-white/[0.04] transition-colors">
+                        <ShieldCheck size={14}/> Two-factor sign-in
                       </button>
                       <button onClick={() => { setAvatarOpen(false); setSignOutOpen(true) }}
                         className="flex w-full items-center gap-2.5 border-t border-neutral-100 px-4 py-2.5 text-[12.5px] font-semibold text-rose-600 hover:bg-rose-50 dark:border-white/[0.06] dark:text-rose-400 dark:hover:bg-rose-500/10 transition-colors">
@@ -767,6 +967,20 @@ export const Layout = () => {
             <Outlet />
           </div>
         </main>
+
+        {twoFactorOpen && <TwoFactorModal onClose={() => setTwoFactorOpen(false)} />}
+        {/* kitchen → waiter: "your order is ready" (restaurant staff, not on the kitchen screen itself) */}
+        {['waiter', 'cashier', 'bar_staff', 'branch_manager', 'org_admin'].includes(user?.current_branch?.role ?? '') && user?.current_branch?.branch_type !== 'hotel' && !location.pathname.startsWith('/restaurant/kitchen') && <ReadyAlerts />}
+
+        {/* Footer */}
+        <footer className="flex shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t border-neutral-200/70 bg-white/90 px-5 py-2.5 text-[11.5px] text-neutral-500 dark:border-white/[0.06] dark:bg-[#0b0c10] dark:text-neutral-400 lg:px-7">
+          <span>© {new Date().getFullYear()} {user?.organization_name ?? 'Hospitality ERP'}. All rights reserved.</span>
+          <span>
+            Prepared by{' '}
+            <a href="https://madalict.com" target="_blank" rel="noreferrer"
+              className="font-medium text-sky-600 hover:underline dark:text-sky-400">Madal ICT — madalict.com</a>
+          </span>
+        </footer>
       </div>
 
       {/* ── Global search palette (Ctrl+K) ─────────────────────────────────── */}
@@ -841,6 +1055,15 @@ export const Layout = () => {
       </AnimatePresence>
 
       {/* Sign-out confirmation modal */}
+      {lockInfo && (
+        <SystemLockScreen
+          user={user}
+          idleMinutes={lockInfo.idle ? IDLE_MINUTES : null}
+          onUnlocked={unlockScreen}
+          onSignOut={() => { try { localStorage.removeItem(LOCK_KEY) } catch { /* ignore */ } logout() }}
+        />
+      )}
+
       <SignOutModal
         open={signOutOpen}
         onClose={() => setSignOutOpen(false)}

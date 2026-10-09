@@ -1,10 +1,10 @@
-import { Router } from 'express'
+import { safeRouter } from '../utils/safeRouter'
 import { requireAuth, requireRole } from '../middleware/auth'
 import {
   listBranches, getBranch, createBranch, updateBranch,
 } from '../controllers/system/branchController'
 
-export const branchRouter = Router()
+export const branchRouter = safeRouter()
 branchRouter.use(requireAuth)
 
 branchRouter.get  ('/',    listBranches)

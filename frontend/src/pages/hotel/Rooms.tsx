@@ -6,7 +6,6 @@ import {
 import { DataTable, type DTColumn } from '@/components/ui/DataTable'
 import Modal, { INPUT, Field, CancelBtn } from '@/components/ui/Modal'
 import { Select } from '@/components/ui/Select'
-import { DatePicker } from '@/components/ui/DatePicker'
 import api from '@/services/api'
 import { getApiErrorMessage } from '@/services/api'
 

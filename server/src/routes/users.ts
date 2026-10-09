@@ -1,4 +1,5 @@
-import { Router } from 'express'
+import { safeRouter } from '../utils/safeRouter'
+import { resetUserTwoFactor } from '../controllers/system/twoFactorController'
 import { requireAuth, requireRole } from '../middleware/auth'
 import {
   listUsers, inviteUser, updateUserBranch, deactivateUser, activateUser, unlockUser,
@@ -8,7 +9,7 @@ import {
   resetUserPassword,
 } from '../controllers/system/userController'
 
-export const usersRouter = Router()
+export const usersRouter = safeRouter()
 usersRouter.use(requireAuth)
 usersRouter.use(requireRole('org_admin', 'branch_manager'))
 
@@ -27,3 +28,4 @@ usersRouter.put   ('/:id/permissions',     setUserPermissions)
 usersRouter.get   ('/:id/submodule-permissions', getUserSubmodulePermissions)
 usersRouter.put   ('/:id/submodule-permissions', setUserSubmodulePermissions)
 usersRouter.patch ('/:id/password',        resetUserPassword)
+usersRouter.post  ('/:id/2fa/reset',       requireRole('org_admin'), resetUserTwoFactor)

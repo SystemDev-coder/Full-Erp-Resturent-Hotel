@@ -1,9 +1,11 @@
 import { Request, Response } from 'express'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
+import { randomBytes } from 'crypto'
 import { query } from '../../db/pool'
 import { logAudit } from '../../utils/audit'
 import { PERM_MODULES, SUBMODULES, FULL, type PermFlags } from './userController'
+import { invalidateUserStatus } from '../../middleware/auth'
 
 const ACCESS_EXPIRES  = process.env.JWT_ACCESS_EXPIRES_IN  ?? '15m'
 const REFRESH_EXPIRES = process.env.JWT_REFRESH_EXPIRES_IN ?? '7d'
@@ -11,8 +13,8 @@ const SECRET          = process.env.JWT_SECRET ?? ''
 
 // After this many consecutive bad passwords, the account is auto-locked for
 // a cooldown period — independent of the manual admin "Lock user" action.
-const MAX_FAILED_ATTEMPTS = 5
-const AUTO_LOCK_MINUTES   = 30
+export const MAX_FAILED_ATTEMPTS = 5
+export const AUTO_LOCK_MINUTES   = 30
 
 function makeAccessToken(payload: object) {
   return jwt.sign(payload, SECRET, { expiresIn: ACCESS_EXPIRES } as any)
@@ -22,9 +24,23 @@ function makeRefreshToken(payload: object) {
   return jwt.sign(payload, SECRET, { expiresIn: REFRESH_EXPIRES } as any)
 }
 
+// One atomic statement: concurrent wrong guesses can't slip past the counter,
+// and the lock is applied in the same write that crosses the limit.
+export async function registerFailedAttempt(userId: string): Promise<number> {
+  const { rows: [r] } = await query(
+    `UPDATE users SET failed_attempts = failed_attempts + 1,
+            locked_until = CASE WHEN failed_attempts + 1 >= $2 THEN NOW() + ($3 || ' minutes')::INTERVAL ELSE locked_until END
+     WHERE id = $1 RETURNING failed_attempts`,
+    [userId, MAX_FAILED_ATTEMPTS, AUTO_LOCK_MINUTES]
+  )
+  invalidateUserStatus(userId)
+  return Number(r.failed_attempts)
+}
+
 export async function login(req: Request, res: Response) {
   try {
-    const { email, password, branch_id } = req.body
+    const { password, branch_id } = req.body
+    const email = String(req.body.email ?? '').trim()
 
     if (!email || !password) {
       return res.status(400).json({ success: false, message: 'Email and password required' })
@@ -33,7 +49,7 @@ export async function login(req: Request, res: Response) {
     // Get user
     const { rows: users } = await query(
       `SELECT u.id, u.email, u.full_name, u.avatar_url, u.password_hash, u.is_active, u.failed_attempts,
-              u.locked_until, u.is_locked, u.organization_id, o.name AS org_name
+              u.locked_until, u.is_locked, u.organization_id, u.totp_enabled, o.name AS org_name
        FROM users u
        JOIN organization o ON o.id = u.organization_id
        WHERE u.email = $1 AND u.deleted_at IS NULL`,
@@ -56,35 +72,61 @@ export async function login(req: Request, res: Response) {
       })
     }
 
-    // Step 3 — lock status (manual admin lock, or auto-lock from repeated bad attempts)
+    // Step 3 — lock status. An auto-lock that has run its course is cleared first, so the
+    // failed-attempt counter starts from zero again (it used to stay at 5: a single wrong
+    // password right after the cooldown re-locked the account for another 30 minutes).
+    if (user.locked_until && new Date(user.locked_until) <= new Date()) {
+      await query(`UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = $1`, [user.id])
+      user.failed_attempts = 0
+      user.locked_until = null
+    }
     const autoLocked = user.locked_until && new Date(user.locked_until) > new Date()
     if (user.is_locked || autoLocked) {
       logAudit({ userId: user.id, action: 'LOGIN_FAILED', req, newValues: { reason: user.is_locked ? 'manually_locked' : 'auto_locked' } })
+      const mins = autoLocked ? Math.ceil((new Date(user.locked_until).getTime() - Date.now()) / 60_000) : 0
       return res.status(403).json({
         success: false,
-        message: 'This account has been locked. Please contact your administrator.',
+        message: autoLocked
+          ? `Too many wrong passwords — this account is locked for ${mins} more minute${mins === 1 ? '' : 's'}. An administrator can unlock it sooner.`
+          : 'This account has been locked by an administrator. Please contact your administrator.',
       })
     }
 
     // Step 4 — verify password
     const valid = await bcrypt.compare(password, user.password_hash)
     if (!valid) {
-      const attempts = Number(user.failed_attempts) + 1
-      if (attempts >= MAX_FAILED_ATTEMPTS) {
-        await query(
-          `UPDATE users SET failed_attempts = $1, locked_until = NOW() + ($2 || ' minutes')::INTERVAL WHERE id = $3`,
-          [attempts, AUTO_LOCK_MINUTES, user.id]
-        )
-      } else {
-        await query(`UPDATE users SET failed_attempts = $1 WHERE id = $2`, [attempts, user.id])
-      }
+      const attempts = await registerFailedAttempt(user.id)
       logAudit({ userId: user.id, action: 'LOGIN_FAILED', req, newValues: { reason: 'wrong_password', attempts } })
+      if (attempts >= MAX_FAILED_ATTEMPTS) {
+        return res.status(403).json({
+          success: false,
+          message: `Too many wrong passwords — this account is now locked for ${AUTO_LOCK_MINUTES} minutes.`,
+        })
+      }
+      const left = MAX_FAILED_ATTEMPTS - attempts
       return res.status(401).json({
         success: false,
-        message: 'Incorrect password. Please try again or contact your administrator to reset it.',
+        message: `Incorrect password. ${left} attempt${left === 1 ? '' : 's'} left before this account locks. Contact your administrator to reset it.`,
       })
     }
 
+    // Step 5 — two-factor: the password alone does not sign in; hand out a 5-minute challenge for the code step
+    if (user.totp_enabled) {
+      return res.json({
+        success: true, requires_2fa: true,
+        challenge: jwt.sign({ typ: '2fa', userId: user.id, branch_id: branch_id ?? null }, SECRET, { expiresIn: '5m' }),
+      })
+    }
+    return await finishLogin(req, res, user, branch_id)
+  } catch (err) {
+    console.error('login error:', err)
+    return res.status(500).json({ success: false, message: 'Login failed' })
+  }
+}
+
+// Everything after the person is proven: pick the branch, issue the tokens. (Password only, or password + 2FA code.)
+export async function finishLogin(req: Request, res: Response, user: any, branch_id?: string) {
+  try {
     // Get branch assignment
     const branchQuery = branch_id
       ? `SELECT ub.branch_id, b.name AS branch_name, b.branch_type, ub.role, ub.is_primary
@@ -100,6 +142,9 @@ export async function login(req: Request, res: Response) {
       branch_id ? [user.id, branch_id] : [user.id]
     )
     const branch = branches[0]
+    if (!branch) {
+      return res.status(403).json({ success: false, message: 'This account is not assigned to an active branch. Please contact your administrator.' })
+    }
 
     // All branches the user can switch between
     const { rows: allBranches } = await query(
@@ -124,7 +169,7 @@ export async function login(req: Request, res: Response) {
     }
 
     const accessToken  = makeAccessToken(tokenPayload)
-    const refreshToken = makeRefreshToken({ userId: user.id })
+    const refreshToken = makeRefreshToken({ userId: user.id, jti: randomBytes(8).toString('hex') })   // unique per login: two sign-ins in the same second used to collide on the token hash
 
     // Store refresh token hash
     await query(
@@ -182,12 +227,25 @@ export async function refreshToken(req: Request, res: Response) {
     )
     if (!rows[0]) return res.status(401).json({ success: false, message: 'Token revoked or expired' })
 
+    // A deactivated, locked or deleted user must not be able to keep minting tokens
+    const { rows: acct } = await query(
+      `SELECT is_active, is_locked, locked_until FROM users WHERE id = $1 AND deleted_at IS NULL`,
+      [payload.userId]
+    )
+    const a = acct[0]
+    if (!a || !a.is_active || a.is_locked || (a.locked_until && new Date(a.locked_until) > new Date())) {
+      await query(`UPDATE refresh_token SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, [payload.userId])
+      return res.status(401).json({ success: false, message: 'Account is not active' })
+    }
+
+    // Keep the branch the user had switched to (if still assigned); else fall back to the primary one
+    const wanted = typeof req.body?.branch_id === 'string' ? req.body.branch_id : null
     const { rows: ubs } = await query(
       `SELECT ub.branch_id, ub.role, ub.is_primary, u.organization_id
        FROM user_branch ub JOIN users u ON u.id = ub.user_id
        WHERE ub.user_id = $1 AND ub.is_active = TRUE AND ub.deleted_at IS NULL
-       ORDER BY ub.is_primary DESC LIMIT 1`,
-      [payload.userId]
+       ORDER BY (ub.branch_id::text = $2) DESC, ub.is_primary DESC LIMIT 1`,
+      [payload.userId, wanted]
     )
     const ub = ubs[0]
 
@@ -327,4 +385,52 @@ export async function switchBranch(req: Request, res: Response) {
     console.error('switchBranch error:', err)
     return res.status(500).json({ success: false, message: 'Failed to switch branch' })
   }
+}
+
+// ─── Screen lock (hotel / finance / every non-POS screen) ──────────────────────
+// Separate from the restaurant POS PIN: that one identifies WHICH waiter/cashier is
+// at a shared till (staff PIN, 4–6 digits). This one protects a logged-in user's own
+// session when they step away — the page stays exactly as it was, and only the
+// account owner's PASSWORD brings it back. Wrong passwords count toward the same
+// auto-lock as the login page, so the lock screen can't be used to brute-force.
+
+export async function lockSession(req: Request, res: Response) {
+  const { userId, branchId } = req.auth!
+  logAudit({ userId, branchId, action: 'SCREEN_LOCKED', tableName: 'users', recordId: userId, req })
+  return res.json({ success: true })
+}
+
+// NOTE: a wrong password answers 400 (never 401) — the frontend treats any 401 as
+// "session invalid" and logs the browser out, which must not happen over a typo.
+export async function unlockSession(req: Request, res: Response) {
+  const { userId, branchId } = req.auth!
+  const password = String(req.body?.password ?? '')
+  if (!password) return res.status(400).json({ success: false, message: 'Enter your password to unlock' })
+
+  const { rows } = await query(
+    `SELECT password_hash, is_active, is_locked, locked_until FROM users WHERE id = $1 AND deleted_at IS NULL`, [userId]
+  )
+  const u = rows[0]
+  if (!u || !u.is_active || u.is_locked) {
+    return res.status(401).json({ success: false, message: 'This account is locked or no longer active' })
+  }
+  if (u.locked_until && new Date(u.locked_until) > new Date()) {
+    return res.status(423).json({ success: false, message: 'Too many wrong passwords — this account is temporarily locked.' })
+  }
+
+  const ok = await bcrypt.compare(password, u.password_hash)
+  if (!ok) {
+    const attempts = await registerFailedAttempt(userId)
+    logAudit({ userId, branchId, action: 'UNLOCK_FAILED', tableName: 'users', recordId: userId, req, newValues: { attempts } })
+    if (attempts >= MAX_FAILED_ATTEMPTS) {
+      await query(`UPDATE refresh_token SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, [userId])
+      return res.status(423).json({ success: false, message: `Too many wrong passwords — this account is locked for ${AUTO_LOCK_MINUTES} minutes.` })
+    }
+    const left = MAX_FAILED_ATTEMPTS - attempts
+    return res.status(400).json({ success: false, message: `Incorrect password. ${left} attempt${left === 1 ? '' : 's'} left.` })
+  }
+
+  await query(`UPDATE users SET failed_attempts = 0 WHERE id = $1`, [userId])
+  logAudit({ userId, branchId, action: 'SCREEN_UNLOCKED', tableName: 'users', recordId: userId, req })
+  return res.json({ success: true })
 }

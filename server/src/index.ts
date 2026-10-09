@@ -6,9 +6,13 @@ import helmet from 'helmet'
 import morgan from 'morgan'
 import cookieParser from 'cookie-parser'
 import rateLimit from 'express-rate-limit'
+import jwt from 'jsonwebtoken'
 
 import { authRouter }        from './routes/auth'
-import { getPublicMenu } from './controllers/restaurant/modifierController'
+import { publicRouter }      from './routes/public'
+import { startBackupScheduler } from './utils/backup'
+import { startNotificationScheduler } from './utils/notify'
+import { startOnlineBookingScheduler } from './controllers/hotel/onlineBookingController'
 import { usersRouter }       from './routes/users'
 import { branchRouter }      from './routes/branches'
 import { hotelRouter }       from './routes/hotel'
@@ -20,6 +24,8 @@ import { systemRouter }      from './routes/system'
 import { dashboardRouter }   from './routes/dashboard'
 import { uploadRouter }      from './routes/upload'
 import { pool }              from './db/pool'
+import { runExtraMigrations } from './db/extraMigrations'
+import { PG_CLIENT_ERRORS }  from './utils/safeRouter'
 
 const app  = express()
 const PORT = process.env.PORT ?? 4000
@@ -38,7 +44,34 @@ process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
 
 // ── Run lightweight migrations on startup ─────────────────────────────────────
 pool.query(`ALTER TABLE guest ADD COLUMN IF NOT EXISTS id_document_image TEXT`).catch(console.error)
+// Payment account / mobile used to be kept in organization.settings; that now lives in the Accounts table
+pool.query(`UPDATE organization SET settings = settings - 'payment_account' - 'payment_mobile' WHERE settings ?| array['payment_account','payment_mobile']`).catch(console.error)
+// Closing a fiscal year (Systems → Closing Period) used to be cosmetic: nothing stopped a posting
+// dated inside a closed year. A trigger on the ledger enforces it for EVERY code path (payments,
+// transfers, expenses, salaries, receipts, manual entries, edits and soft-deletes alike).
+pool.query(`
+  CREATE OR REPLACE FUNCTION enforce_open_fiscal_year() RETURNS trigger AS $$
+  DECLARE fy_name TEXT; d DATE; org UUID;
+  BEGIN
+    IF TG_OP = 'DELETE' THEN d := OLD.transaction_date; org := OLD.organization_id;
+    ELSE d := NEW.transaction_date; org := NEW.organization_id; END IF;
+    SELECT name INTO fy_name FROM fiscal_year
+      WHERE organization_id = org AND is_closed = TRUE AND deleted_at IS NULL AND d BETWEEN start_date AND end_date LIMIT 1;
+    IF fy_name IS NOT NULL THEN
+      RAISE EXCEPTION 'FISCAL_CLOSED: % is closed — nothing can be posted, changed or removed on % (reopen it or post on a date in an open period)', fy_name, d;
+    END IF;
+    RETURN COALESCE(NEW, OLD);
+  END $$ LANGUAGE plpgsql
+`).then(() => pool.query(`DROP TRIGGER IF EXISTS trg_transaction_fiscal_lock ON transaction`))
+  .then(() => pool.query(`CREATE TRIGGER trg_transaction_fiscal_lock BEFORE INSERT OR UPDATE OF amount, transaction_date, deleted_at, status, direction, account_id
+                          ON transaction FOR EACH ROW EXECUTE FUNCTION enforce_open_fiscal_year()`))
+  .catch(console.error)
+// housekeeping_task shipped without updated_at, but the edit/assign endpoints stamp it.
+pool.query(`ALTER TABLE housekeeping_task ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`).catch(console.error)
 pool.query(`ALTER TABLE staff ADD COLUMN IF NOT EXISTS pos_pin VARCHAR(100)`).catch(console.error)
+// POS PIN brute-force protection: a 4-6 digit PIN is trivially guessable without a lockout
+pool.query(`ALTER TABLE staff ADD COLUMN IF NOT EXISTS pos_pin_failed INT NOT NULL DEFAULT 0`).catch(console.error)
+pool.query(`ALTER TABLE staff ADD COLUMN IF NOT EXISTS pos_pin_locked_until TIMESTAMPTZ`).catch(console.error)
 // Manual admin-triggered lock — distinct from the auto-lock (locked_until)
 // that kicks in after repeated failed login attempts.
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_locked BOOLEAN NOT NULL DEFAULT FALSE`).catch(console.error)
@@ -106,16 +139,28 @@ pool.query(`
 // DEFERRABLE INITIALLY DEFERRED delays the check to COMMIT, by which point
 // the swap is consistent. Postgres has no "ALTER CONSTRAINT ... DEFERRABLE"
 // for exclusion constraints, so it must be dropped and recreated.
+// Runs as ONE atomic DO block and only when the constraint is not already
+// deferrable: if the re-ADD fails (e.g. legacy overlapping rows) the DROP rolls
+// back with it, so the double-booking guard is never left missing, and it no
+// longer drops/recreates the constraint on every server restart.
 pool.query(`
-  ALTER TABLE booking DROP CONSTRAINT IF EXISTS booking_room_id_daterange_excl
-`).then(() => pool.query(`
-  ALTER TABLE booking ADD CONSTRAINT booking_room_id_daterange_excl
-    EXCLUDE USING gist (
-      room_id WITH =,
-      daterange(check_in_date, check_out_date, '[)') WITH &&
-    ) WHERE (status NOT IN ('cancelled','no_show') AND deleted_at IS NULL)
-    DEFERRABLE INITIALLY DEFERRED
-`)).catch(console.error)
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'booking_room_id_daterange_excl'
+        AND conrelid = 'booking'::regclass AND condeferrable
+    ) THEN
+      ALTER TABLE booking DROP CONSTRAINT IF EXISTS booking_room_id_daterange_excl;
+      ALTER TABLE booking ADD CONSTRAINT booking_room_id_daterange_excl
+        EXCLUDE USING gist (
+          room_id WITH =,
+          daterange(check_in_date, check_out_date, '[)') WITH &&
+        ) WHERE (status NOT IN ('cancelled','no_show') AND deleted_at IS NULL)
+        DEFERRABLE INITIALLY DEFERRED;
+    END IF;
+  END $$
+`).catch(console.error)
 pool.query(`
   CREATE TABLE IF NOT EXISTS receipt (
     id              UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -178,12 +223,42 @@ app.use(cors({
   origin:      process.env.FRONTEND_URL ?? 'http://localhost:5173',
   credentials: true,
 }))
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 300 }))
+// Behind a reverse proxy/load balancer set TRUST_PROXY (e.g. "1") so req.ip is the real client
+if (process.env.TRUST_PROXY) app.set('trust proxy', /^\d+$/.test(process.env.TRUST_PROXY) ? Number(process.env.TRUST_PROXY) : process.env.TRUST_PROXY)
+
+// General API limit — counted PER SIGNED-IN USER, not per IP. The old flat 300 requests / 15 min
+// per IP was exhausted within minutes by one busy screen (every page loads several endpoints, the
+// dashboard and notifications poll), and a whole hotel LAN shares one IP — so staff were logged
+// out with HTTP 429. Anonymous traffic is still limited per IP.
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 3000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === '/api/health',
+  keyGenerator: (req) => {
+    const token = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : ''
+    const id = token ? (jwt.decode(token) as { userId?: string } | null)?.userId : undefined
+    return id ? `u:${id}` : `ip:${req.ip}`
+  },
+  message: { success: false, message: 'Too many requests — please wait a moment and try again.' },
+}))
+
+// Brute-force guard for the login form (per-account lockout exists too, this stops password spraying)
+app.use('/api/auth/login', rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many sign-in attempts from this network — try again in a few minutes.' },
+}))
 
 // ── Static files (document uploads) ──────────────────────────────────────────
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')))
 
 // ── Body parsing ──────────────────────────────────────────────────────────────
+// import files can carry a couple of thousand rows
+app.use('/api/system/import', express.json({ limit: '5mb' }))
 app.use(express.json({ limit: '1mb' }))
 app.use(cookieParser())
 app.use(morgan('dev'))
@@ -202,7 +277,7 @@ app.use('/api/hr',          hrRouter)
 app.use('/api/system',      systemRouter)
 
 // ── Public (no auth) ─────────────────────────────────────────────────────────
-app.get('/api/public/menu/:branchId', getPublicMenu)
+app.use('/api/public', publicRouter)
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => {
@@ -217,16 +292,29 @@ app.use((_req, res) => {
 // ── Error handler ─────────────────────────────────────────────────────────────
 app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(err)
+  if (res.headersSent) return
+  if (err?.code === 'P0001' && typeof err.message === 'string' && err.message.startsWith('FISCAL_CLOSED:')) {
+    return res.status(409).json({ success: false, message: err.message.replace('FISCAL_CLOSED: ', '') })
+  }
+  const pg = err?.code ? PG_CLIENT_ERRORS[err.code] : undefined
+  if (pg) return res.status(pg.status).json({ success: false, message: pg.message })
   const status = err.status ?? err.statusCode ?? 500
-  res.status(status).json({ success: false, message: err.message ?? 'Internal server error' })
+  // Never leak raw DB/driver messages for unexpected (5xx) failures
+  const message = status >= 500 ? 'Internal server error' : (err.message ?? 'Request failed')
+  res.status(status).json({ success: false, message })
 })
 
-app.listen(PORT, () => {
-  console.log(`\n  Hospitality ERP Server`)
-  console.log(`  ─────────────────────────`)
-  console.log(`  Running : http://localhost:${PORT}`)
-  console.log(`  Health  : http://localhost:${PORT}/api/health`)
-  console.log(`  Env     : ${process.env.NODE_ENV ?? 'development'}\n`)
+runExtraMigrations().finally(() => {
+  app.listen(PORT, () => {
+    startBackupScheduler()
+    startNotificationScheduler()
+    startOnlineBookingScheduler()
+    console.log(`\n  Hospitality ERP Server`)
+    console.log(`  ─────────────────────────`)
+    console.log(`  Running : http://localhost:${PORT}`)
+    console.log(`  Health  : http://localhost:${PORT}/api/health`)
+    console.log(`  Env     : ${process.env.NODE_ENV ?? 'development'}\n`)
+  })
 })
 
 export default app

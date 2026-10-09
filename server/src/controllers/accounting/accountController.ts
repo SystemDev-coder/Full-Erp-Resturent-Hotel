@@ -646,45 +646,45 @@ export async function deleteExpensePayment(req: Request, res: Response) {
 export async function payExpenseCharge(req: Request, res: Response) {
   const { orgId, branchId, userId } = req.auth!
   const { id } = req.params
-  const { account_id, amount, payment_date, reference_number, notes } = req.body
+  const { account_id, payment_date, reference_number, notes } = req.body
+  const amount = Number(req.body.amount)
 
-  if (!account_id || !amount) {
-    return res.status(400).json({ success: false, message: 'account_id and amount are required' })
-  }
-
-  const { rows: charges } = await query(
-    `SELECT ec.*, e.name AS expense_name FROM expense_charge ec
-     JOIN expense e ON e.id = ec.expense_id
-     WHERE ec.id = $1 AND ec.deleted_at IS NULL`,
-    [id]
-  )
-  if (!charges[0]) return res.status(404).json({ success: false, message: 'Expense charge not found' })
-  if (charges[0].status === 'paid') return res.status(409).json({ success: false, message: 'Already paid' })
+  if (!account_id) return res.status(400).json({ success: false, message: 'account_id and amount are required' })
+  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, message: 'amount must be a positive number' })
 
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
+    const { rows: [charge] } = await client.query(
+      `SELECT ec.id, ec.amount AS total, ec.status, e.name AS expense_name,
+              COALESCE((SELECT SUM(amount) FROM expense_payment WHERE expense_charge_id = ec.id AND deleted_at IS NULL), 0) AS paid
+       FROM expense_charge ec JOIN expense e ON e.id = ec.expense_id
+       WHERE ec.id = $1 AND ec.branch_id = $2 AND ec.deleted_at IS NULL FOR UPDATE OF ec`,
+      [id, branchId]
+    )
+    if (!charge) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, message: 'Expense charge not found' }) }
+    if (charge.status === 'paid') { await client.query('ROLLBACK'); return res.status(409).json({ success: false, message: 'Already paid' }) }
+    if (charge.status === 'voided') { await client.query('ROLLBACK'); return res.status(409).json({ success: false, message: 'This expense is voided' }) }
 
+    const due = Math.round((Number(charge.total) - Number(charge.paid)) * 100) / 100
+    if (amount > due + 0.005) { await client.query('ROLLBACK'); return res.status(409).json({ success: false, message: `Amount exceeds the balance due (${due.toFixed(2)})` }) }
+    const acc = await client.query(
+      `SELECT 1 FROM account WHERE id = $1 AND organization_id = $2 AND (branch_id = $3 OR branch_id IS NULL) AND is_active = TRUE AND deleted_at IS NULL`,
+      [account_id, orgId, branchId])
+    if (!acc.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, message: 'Account not found' }) }
+
+    const when = payment_date ?? new Date().toISOString().slice(0, 10)
     const { rows: [payment] } = await client.query(
       `INSERT INTO expense_payment (organization_id, branch_id, expense_charge_id, account_id, amount, payment_date, reference_number, notes, paid_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-      [orgId, branchId, id, account_id, amount,
-       payment_date ?? new Date().toISOString().slice(0,10),
-       reference_number ?? null, notes ?? null, userId]
+      [orgId, branchId, id, account_id, amount, when, reference_number ?? null, notes ?? null, userId]
     )
-
-    await client.query(
-      `UPDATE expense_charge SET status = 'paid' WHERE id = $1`, [id]
-    )
-
+    await client.query(`UPDATE expense_charge SET status = $2 WHERE id = $1`, [id, amount >= due - 0.005 ? 'paid' : 'approved'])
     await client.query(
       `INSERT INTO transaction (organization_id, branch_id, account_id, direction, transaction_type, reference_type, reference_id, description, amount, transaction_date, created_by)
        VALUES ($1,$2,$3,'out','expense','expense_payment',$4,$5,$6,$7,$8)`,
-      [orgId, branchId, account_id, payment.id,
-       `Expense: ${charges[0].expense_name}`, amount,
-       payment_date ?? new Date().toISOString().slice(0,10), userId]
+      [orgId, branchId, account_id, payment.id, `Expense: ${charge.expense_name}`, amount, when, userId]
     )
-
     await client.query('COMMIT')
     return res.json({ success: true, data: payment })
   } catch (err) {
@@ -810,43 +810,45 @@ export async function deleteSalaryPayment(req: Request, res: Response) {
 export async function paySalaryCharge(req: Request, res: Response) {
   const { orgId, branchId, userId } = req.auth!
   const { id } = req.params
-  const { account_id, amount, payment_date, reference_number, notes } = req.body
+  const { account_id, payment_date, reference_number, notes } = req.body
+  const amount = Number(req.body.amount)
 
-  if (!account_id || !amount) {
-    return res.status(400).json({ success: false, message: 'account_id and amount are required' })
-  }
-
-  const { rows: charges } = await query(
-    `SELECT sc.*, s.first_name || ' ' || s.last_name AS staff_name
-     FROM salary_charge sc JOIN staff s ON s.id = sc.staff_id
-     WHERE sc.id = $1 AND sc.deleted_at IS NULL`,
-    [id]
-  )
-  if (!charges[0]) return res.status(404).json({ success: false, message: 'Salary charge not found' })
-  if (charges[0].status === 'paid') return res.status(409).json({ success: false, message: 'Already paid' })
+  if (!account_id) return res.status(400).json({ success: false, message: 'account_id and amount are required' })
+  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, message: 'amount must be a positive number' })
 
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
+    const { rows: [charge] } = await client.query(
+      `SELECT sc.id, sc.net_amount, sc.status, s.first_name || ' ' || s.last_name AS staff_name,
+              COALESCE((SELECT SUM(amount) FROM salary_payment WHERE salary_charge_id = sc.id AND deleted_at IS NULL), 0) AS paid
+       FROM salary_charge sc JOIN staff s ON s.id = sc.staff_id
+       WHERE sc.id = $1 AND sc.branch_id = $2 AND sc.deleted_at IS NULL FOR UPDATE OF sc`,
+      [id, branchId]
+    )
+    if (!charge) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, message: 'Salary charge not found' }) }
+    if (charge.status === 'paid') { await client.query('ROLLBACK'); return res.status(409).json({ success: false, message: 'Already paid' }) }
 
+    const due = Math.round((Number(charge.net_amount) - Number(charge.paid)) * 100) / 100
+    if (amount > due + 0.005) { await client.query('ROLLBACK'); return res.status(409).json({ success: false, message: `Amount exceeds the salary still due (${due.toFixed(2)})` }) }
+    const acc = await client.query(
+      `SELECT 1 FROM account WHERE id = $1 AND organization_id = $2 AND (branch_id = $3 OR branch_id IS NULL) AND is_active = TRUE AND deleted_at IS NULL`,
+      [account_id, orgId, branchId])
+    if (!acc.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, message: 'Account not found' }) }
+
+    const when = payment_date ?? new Date().toISOString().slice(0, 10)
     const { rows: [payment] } = await client.query(
       `INSERT INTO salary_payment (organization_id, branch_id, salary_charge_id, account_id, amount, payment_date, reference_number, notes, paid_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-      [orgId, branchId, id, account_id, amount,
-       payment_date ?? new Date().toISOString().slice(0,10),
-       reference_number ?? null, notes ?? null, userId]
+      [orgId, branchId, id, account_id, amount, when, reference_number ?? null, notes ?? null, userId]
     )
-
-    await client.query(`UPDATE salary_charge SET status = 'paid' WHERE id = $1`, [id])
-
+    // Only fully paid once the payments add up to the net salary (a part-payment keeps it open)
+    await client.query(`UPDATE salary_charge SET status = $2 WHERE id = $1`, [id, amount >= due - 0.005 ? 'paid' : 'approved'])
     await client.query(
       `INSERT INTO transaction (organization_id, branch_id, account_id, direction, transaction_type, reference_type, reference_id, description, amount, transaction_date, created_by)
        VALUES ($1,$2,$3,'out','salary','salary_payment',$4,$5,$6,$7,$8)`,
-      [orgId, branchId, account_id, payment.id,
-       `Salary: ${charges[0].staff_name}`, amount,
-       payment_date ?? new Date().toISOString().slice(0,10), userId]
+      [orgId, branchId, account_id, payment.id, `Salary: ${charge.staff_name}`, amount, when, userId]
     )
-
     await client.query('COMMIT')
     return res.json({ success: true, data: payment })
   } catch (err) {

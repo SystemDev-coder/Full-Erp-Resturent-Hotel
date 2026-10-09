@@ -1,6 +1,15 @@
 import { Request, Response } from 'express'
 import { query } from '../../db/pool'
 
+const fail = (res: Response, status: number, message: string) =>
+  res.status(status).json({ success: false, message })
+
+const isPositive = (v: unknown) => Number.isFinite(Number(v)) && Number(v) > 0
+
+const SERVICE_CATEGORIES = ['minibar', 'laundry', 'room_service', 'telephone', 'spa', 'transport', 'other']
+
+// ── Room Types ────────────────────────────────────────────────────────────────
+
 export async function listRoomTypes(req: Request, res: Response) {
   const { rows } = await query(
     `SELECT rt.id, rt.name, rt.description, rt.max_adults, rt.max_children,
@@ -19,12 +28,16 @@ export async function listRoomTypes(req: Request, res: Response) {
 export async function createRoomType(req: Request, res: Response) {
   const { name, description, max_adults = 2, max_children = 1,
           bed_configuration, area_sqm, features = [] } = req.body
-  if (!name) return res.status(400).json({ success: false, message: 'name is required' })
+  if (!name) return fail(res, 400, 'name is required')
+  if (!Number.isInteger(Number(max_adults)) || Number(max_adults) < 1 ||
+      !Number.isInteger(Number(max_children)) || Number(max_children) < 0) {
+    return fail(res, 400, 'max_adults must be at least 1 and max_children cannot be negative')
+  }
 
   const { rows: [hotel] } = await query(
-    `SELECT id FROM hotel WHERE branch_id = $1`, [req.auth!.branchId]
+    `SELECT id FROM hotel WHERE branch_id = $1 AND deleted_at IS NULL`, [req.auth!.branchId]
   )
-  if (!hotel) return res.status(404).json({ success: false, message: 'Hotel not found for this branch' })
+  if (!hotel) return fail(res, 404, 'Hotel not found for this branch')
 
   const { rows } = await query(
     `INSERT INTO room_type (hotel_id, name, description, max_adults, max_children,
@@ -53,12 +66,13 @@ export async function updateRoomType(req: Request, res: Response) {
        is_active         = COALESCE($8, is_active),
        updated_at        = NOW()
      WHERE id = $9 AND deleted_at IS NULL
+       AND hotel_id IN (SELECT id FROM hotel WHERE branch_id = $10)
      RETURNING id, name, is_active`,
     [name ?? null, description ?? null, max_adults ?? null, max_children ?? null,
      bed_configuration ?? null, area_sqm ?? null,
-     features ? JSON.stringify(features) : null, is_active ?? null, id]
+     features ? JSON.stringify(features) : null, is_active ?? null, id, req.auth!.branchId]
   )
-  if (!rows[0]) return res.status(404).json({ success: false, message: 'Room type not found' })
+  if (!rows[0]) return fail(res, 404, 'Room type not found')
   return res.json({ success: true, data: rows[0] })
 }
 
@@ -83,13 +97,20 @@ export async function createRatePlan(req: Request, res: Response) {
   const { room_type_id, name, price_per_night, min_stay_nights = 1,
           is_breakfast_included = false, valid_from, valid_to } = req.body
   if (!room_type_id || !name || !price_per_night || !valid_from) {
-    return res.status(400).json({ success: false, message: 'room_type_id, name, price_per_night, valid_from are required' })
+    return fail(res, 400, 'room_type_id, name, price_per_night, valid_from are required')
   }
+  if (!isPositive(price_per_night)) return fail(res, 400, 'price_per_night must be a positive number')
+  if (valid_to && String(valid_to) < String(valid_from)) return fail(res, 400, 'valid_to cannot be before valid_from')
 
   const { rows: [hotel] } = await query(
-    `SELECT id FROM hotel WHERE branch_id = $1`, [req.auth!.branchId]
+    `SELECT id FROM hotel WHERE branch_id = $1 AND deleted_at IS NULL`, [req.auth!.branchId]
   )
-  if (!hotel) return res.status(404).json({ success: false, message: 'Hotel not found' })
+  if (!hotel) return fail(res, 404, 'Hotel not found')
+
+  const { rows: rt } = await query(
+    `SELECT 1 FROM room_type WHERE id = $1 AND hotel_id = $2 AND deleted_at IS NULL`, [room_type_id, hotel.id]
+  )
+  if (!rt[0]) return fail(res, 404, 'Room type not found in this hotel')
 
   const { rows } = await query(
     `INSERT INTO rate_plan (hotel_id, room_type_id, name, price_per_night,
@@ -105,6 +126,9 @@ export async function updateRatePlan(req: Request, res: Response) {
   const { id } = req.params
   const { name, price_per_night, min_stay_nights,
           is_breakfast_included, valid_from, valid_to, is_active } = req.body
+  if (price_per_night !== undefined && !isPositive(price_per_night)) {
+    return fail(res, 400, 'price_per_night must be a positive number')
+  }
 
   const { rows } = await query(
     `UPDATE rate_plan SET
@@ -117,18 +141,28 @@ export async function updateRatePlan(req: Request, res: Response) {
        is_active             = COALESCE($7, is_active),
        updated_at            = NOW()
      WHERE id = $8 AND deleted_at IS NULL
+       AND hotel_id IN (SELECT id FROM hotel WHERE branch_id = $9)
      RETURNING id, name, price_per_night, is_active`,
     [name ?? null, price_per_night ?? null, min_stay_nights ?? null,
      is_breakfast_included ?? null, valid_from ?? null, valid_to ?? null,
-     is_active ?? null, id]
+     is_active ?? null, id, req.auth!.branchId]
   )
-  if (!rows[0]) return res.status(404).json({ success: false, message: 'Rate plan not found' })
+  if (!rows[0]) return fail(res, 404, 'Rate plan not found')
   return res.json({ success: true, data: rows[0] })
 }
 
-// ── Booking Services ──────────────────────────────────────────────────────────
+// ── Booking Services (extras charged to a stay) ───────────────────────────────
+
+const bookingInBranch = async (bookingId: string, branchId: string) => {
+  const { rows } = await query(
+    `SELECT status FROM booking WHERE id = $1 AND branch_id = $2 AND deleted_at IS NULL`,
+    [bookingId, branchId]
+  )
+  return rows[0] as { status: string } | undefined
+}
 
 export async function listBookingServices(req: Request, res: Response) {
+  if (!(await bookingInBranch(req.params.id, req.auth!.branchId))) return fail(res, 404, 'Booking not found')
   const { rows } = await query(
     `SELECT id, service_name, service_category, quantity, unit_price, line_total, notes, served_at
      FROM booking_service WHERE booking_id = $1 AND deleted_at IS NULL ORDER BY served_at`,
@@ -139,9 +173,18 @@ export async function listBookingServices(req: Request, res: Response) {
 
 export async function addBookingService(req: Request, res: Response) {
   const { service_name, service_category = 'other', quantity = 1, unit_price, notes } = req.body
-  if (!service_name || !unit_price) {
-    return res.status(400).json({ success: false, message: 'service_name and unit_price are required' })
+  if (!service_name || !unit_price) return fail(res, 400, 'service_name and unit_price are required')
+  if (!isPositive(unit_price) || !isPositive(quantity)) return fail(res, 400, 'quantity and unit_price must be positive numbers')
+  if (!SERVICE_CATEGORIES.includes(service_category)) {
+    return fail(res, 400, `service_category must be one of: ${SERVICE_CATEGORIES.join(', ')}`)
   }
+
+  const booking = await bookingInBranch(req.params.id, req.auth!.branchId)
+  if (!booking) return fail(res, 404, 'Booking not found')
+  if (['cancelled', 'checked_out', 'no_show'].includes(booking.status)) {
+    return fail(res, 409, `Cannot add services to a ${booking.status.replace(/_/g, ' ')} booking`)
+  }
+
   const { rows } = await query(
     `INSERT INTO booking_service (booking_id, service_name, service_category, quantity, unit_price, notes, created_by)
      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, service_name, line_total`,
@@ -155,9 +198,12 @@ export async function addBookingService(req: Request, res: Response) {
 
 export async function listLoyaltyTransactions(req: Request, res: Response) {
   const { rows } = await query(
-    `SELECT id, points_change, balance_after, reason, reference_type, created_at
-     FROM loyalty_transaction WHERE guest_id = $1 ORDER BY created_at DESC LIMIT 50`,
-    [req.params.guestId]
+    `SELECT lt.id, lt.points_change, lt.balance_after, lt.reason, lt.reference_type, lt.created_at
+     FROM loyalty_transaction lt
+     JOIN guest g ON g.id = lt.guest_id
+     WHERE lt.guest_id = $1 AND g.organization_id = $2
+     ORDER BY lt.created_at DESC LIMIT 50`,
+    [req.params.guestId, req.auth!.orgId]
   )
   return res.json({ success: true, data: rows })
 }
@@ -165,22 +211,30 @@ export async function listLoyaltyTransactions(req: Request, res: Response) {
 export async function addLoyaltyPoints(req: Request, res: Response) {
   const { guestId } = req.params
   const { points_change, reason, reference_type, reference_id } = req.body
-  if (!points_change || !reason) {
-    return res.status(400).json({ success: false, message: 'points_change and reason are required' })
+  const delta = Number(points_change)
+  if (!Number.isInteger(delta) || delta === 0 || !reason) {
+    return fail(res, 400, 'points_change (a non-zero whole number) and reason are required')
   }
 
+  // One atomic statement: no lost updates under concurrency, and the balance can never go negative.
   const { rows: [g] } = await query(
-    `SELECT loyalty_points FROM guest WHERE id = $1`, [guestId]
+    `UPDATE guest SET loyalty_points = loyalty_points + $1
+     WHERE id = $2 AND organization_id = $3 AND deleted_at IS NULL AND loyalty_points + $1 >= 0
+     RETURNING loyalty_points`,
+    [delta, guestId, req.auth!.orgId]
   )
-  if (!g) return res.status(404).json({ success: false, message: 'Guest not found' })
-
-  const newBalance = Number(g.loyalty_points) + Number(points_change)
-  await query(`UPDATE guest SET loyalty_points = $1 WHERE id = $2`, [newBalance, guestId])
+  if (!g) {
+    const { rows: exists } = await query(
+      `SELECT 1 FROM guest WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL`,
+      [guestId, req.auth!.orgId]
+    )
+    return exists[0] ? fail(res, 409, 'Not enough loyalty points for this redemption') : fail(res, 404, 'Guest not found')
+  }
 
   const { rows } = await query(
     `INSERT INTO loyalty_transaction (guest_id, points_change, balance_after, reason, reference_type, reference_id, created_by)
      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, balance_after`,
-    [guestId, points_change, newBalance, reason,
+    [guestId, delta, g.loyalty_points, reason,
      reference_type ?? null, reference_id ?? null, req.auth!.userId]
   )
   return res.status(201).json({ success: true, data: rows[0] })
@@ -188,11 +242,13 @@ export async function addLoyaltyPoints(req: Request, res: Response) {
 
 // ── Available Rooms ───────────────────────────────────────────────────────────
 
+// "Available" means free for the requested DATES — not "status = available right
+// now". Filtering on today's status hid every room that is occupied tonight but
+// free next week, so future bookings could only use rooms that were empty today.
 export async function listAvailableRooms(req: Request, res: Response) {
   const { check_in, check_out, room_type_id } = req.query
-  if (!check_in || !check_out) {
-    return res.status(400).json({ success: false, message: 'check_in and check_out query params are required' })
-  }
+  if (!check_in || !check_out) return fail(res, 400, 'check_in and check_out query params are required')
+  if (String(check_out) <= String(check_in)) return fail(res, 400, 'check_out must be after check_in')
 
   let sql = `
     SELECT r.id, r.room_number, r.floor, r.is_smoking,
@@ -201,15 +257,20 @@ export async function listAvailableRooms(req: Request, res: Response) {
     FROM room r
     JOIN room_type rt ON rt.id = r.room_type_id
     JOIN hotel h ON h.id = r.hotel_id
-    LEFT JOIN rate_plan rp ON rp.room_type_id = rt.id AND rp.is_active = TRUE
-      AND rp.valid_from <= $3::date AND (rp.valid_to IS NULL OR rp.valid_to >= $2::date)
+    LEFT JOIN LATERAL (
+      SELECT price_per_night, is_breakfast_included FROM rate_plan
+      WHERE room_type_id = rt.id AND is_active = TRUE AND deleted_at IS NULL
+        AND valid_from <= $3::date AND (valid_to IS NULL OR valid_to >= $2::date)
+      ORDER BY price_per_night ASC LIMIT 1
+    ) rp ON TRUE
     WHERE h.branch_id = $1
       AND r.deleted_at IS NULL
-      AND r.status = 'available'
-      AND r.id NOT IN (
-        SELECT room_id FROM booking
-        WHERE status NOT IN ('cancelled','no_show') AND deleted_at IS NULL
-          AND daterange(check_in_date, check_out_date, '[)') &&
+      AND r.status NOT IN ('maintenance', 'out_of_order')
+      AND NOT EXISTS (
+        SELECT 1 FROM booking b
+        WHERE b.room_id = r.id
+          AND b.status NOT IN ('cancelled','no_show') AND b.deleted_at IS NULL
+          AND daterange(b.check_in_date, b.check_out_date, '[)') &&
               daterange($2::date, $3::date, '[)')
       )`
 

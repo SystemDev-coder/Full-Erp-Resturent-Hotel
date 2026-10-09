@@ -1,9 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Plus, RefreshCw, Building2, TrendingUp, Boxes, Eraser, CalendarCheck,
-  PieChart, Save, Lock, Trash2, ArrowLeftRight, Landmark, Users as UsersIcon,
-  ImagePlus, X, ArrowDownCircle, ArrowUpCircle,
+  PieChart, Save, Lock, Unlock, Trash2, ArrowLeftRight, Landmark, Users as UsersIcon,
+  ImagePlus, X, ArrowDownCircle, ArrowUpCircle, DatabaseBackup, ShieldCheck, BellRing, FileSpreadsheet, Globe,
 } from 'lucide-react'
+import { ApprovalPolicyPanel } from '@/components/system/ApprovalPolicyPanel'
+import { NotificationsPanel } from '@/components/system/NotificationsPanel'
+import { ImportPanel } from '@/components/system/ImportPanel'
+import { OnlineBookingPanel } from '@/components/system/OnlineBookingPanel'
 import { DataTable, type DTColumn } from '@/components/ui/DataTable'
 import Modal, { INPUT, Field, CancelBtn } from '@/components/ui/Modal'
 import { Select } from '@/components/ui/Select'
@@ -11,11 +15,11 @@ import { DatePicker } from '@/components/ui/DatePicker'
 import { Tabs } from '@/components/ui/Tabs'
 import { ImageThumb } from '@/components/ui/ImageThumb'
 import ImageModal from '@/components/ui/ImageModal'
+import { BackupPanel } from '@/components/system/BackupPanel'
+import { isImageFile, MAX_IMAGE_BYTES, IMAGE_ACCEPT } from '@utils/imageFile'
 import api from '@/services/api'
 import { getApiErrorMessage } from '@/services/api'
 
-const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/jpg']
-const MAX_IMAGE_BYTES = 15 * 1024 * 1024
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -23,6 +27,7 @@ interface Organization {
   id: string; name: string; legal_name?: string; tax_id?: string
   default_timezone?: string; phone?: string; email?: string
   logo_url?: string; banner_url?: string
+  address?: string
   created_at: string; branch_count: string; user_count: string
 }
 
@@ -61,7 +66,7 @@ function todayISO() {
 
 // ─── Forms ────────────────────────────────────────────────────────────────────
 
-interface OrgForm { name: string; legal_name: string; tax_id: string; phone: string; email: string; default_timezone: string; vat_rate: string; logo_url: string; banner_url: string }
+interface OrgForm { name: string; legal_name: string; tax_id: string; phone: string; email: string; default_timezone: string; vat_rate: string; logo_url: string; banner_url: string; address: string }
 
 interface CapitalForm { name: string; institution: string; notes: string; opening_balance: string }
 const EMPTY_CAPITAL: CapitalForm = { name: '', institution: '', notes: '', opening_balance: '' }
@@ -89,7 +94,7 @@ const EMPTY_SHARE = (): ShareForm => ({ partner_name: '', share_percent: '', amo
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function Systems() {
-  const [tab, setTab] = useState<'company' | 'capital' | 'assets' | 'cleaner' | 'closing' | 'profit'>('company')
+  const [tab, setTab] = useState<'company' | 'capital' | 'assets' | 'cleaner' | 'closing' | 'profit' | 'backup' | 'approvals' | 'notifications' | 'import' | 'online'>('company')
 
   const [org,      setOrg]      = useState<Organization | null>(null)
   const [accounts, setAccounts] = useState<Account[]>([])
@@ -113,7 +118,7 @@ export default function Systems() {
   const [capitalToDelete, setCapitalToDelete] = useState<Account | null>(null)
   const [capitalTxTarget, setCapitalTxTarget] = useState<Account | null>(null)
 
-  const [orgForm,     setOrgForm]     = useState<OrgForm>({ name: '', legal_name: '', tax_id: '', phone: '', email: '', default_timezone: '', vat_rate: '', logo_url: '', banner_url: '' })
+  const [orgForm,     setOrgForm]     = useState<OrgForm>({ name: '', legal_name: '', tax_id: '', phone: '', email: '', default_timezone: '', vat_rate: '', logo_url: '', banner_url: '', address: '' })
   const [capitalForm, setCapitalForm] = useState<CapitalForm>(EMPTY_CAPITAL)
   const [capitalTxAccountId, setCapitalTxAccountId] = useState('')
   const [capitalTxAmount,    setCapitalTxAmount]    = useState('')
@@ -149,6 +154,7 @@ export default function Systems() {
         phone: o.phone ?? '', email: o.email ?? '', default_timezone: o.default_timezone ?? '',
         vat_rate: (o as Organization & { vat_rate?: string }).vat_rate ?? '',
         logo_url: o.logo_url ?? '', banner_url: o.banner_url ?? '',
+        address: o.address ?? '',
       })
       setLogoFile(null); setLogoPreview(o.logo_url ?? '')
       setBannerFile(null); setBannerPreview(o.banner_url ?? '')
@@ -177,8 +183,8 @@ export default function Systems() {
     const file = e.target.files?.[0]
     e.target.value = ''
     if (!file) return
-    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) { setError('Unsupported image format — please use JPG, PNG, or WebP.'); return }
-    if (file.size > MAX_IMAGE_BYTES) { setError('Image is too large — please use a file under 15MB.'); return }
+    if (!isImageFile(file)) { setError('That file is not an image — choose a JPG, PNG, WebP, GIF, SVG or AVIF picture.'); return }
+    if (file.size > MAX_IMAGE_BYTES) { setError('Image is too large — please use a file under 25 MB.'); return }
     setError('')
     setLogoFile(file); setLogoPreview(URL.createObjectURL(file))
   }
@@ -186,16 +192,19 @@ export default function Systems() {
     const file = e.target.files?.[0]
     e.target.value = ''
     if (!file) return
-    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) { setError('Unsupported image format — please use JPG, PNG, or WebP.'); return }
-    if (file.size > MAX_IMAGE_BYTES) { setError('Image is too large — please use a file under 15MB.'); return }
+    if (!isImageFile(file)) { setError('That file is not an image — choose a JPG, PNG, WebP, GIF, SVG or AVIF picture.'); return }
+    if (file.size > MAX_IMAGE_BYTES) { setError('Image is too large — please use a file under 25 MB.'); return }
     setError('')
     setBannerFile(file); setBannerPreview(URL.createObjectURL(file))
   }
-  const uploadIfNeeded = async (file: File | null): Promise<string | undefined> => {
+  // Logo / banner go through the branding endpoint, which accepts any readable image and
+  // fits it to the right size (it used to call a route that did not exist, so every upload failed).
+  const uploadIfNeeded = async (file: File | null, kind: 'logo' | 'banner'): Promise<string | undefined> => {
     if (!file) return undefined
     const fd = new FormData()
+    fd.append('kind', kind)
     fd.append('file', file)
-    const up = await api.post('/upload/document', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+    const up = await api.post('/uploads/branding', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
     return up.data.url
   }
 
@@ -203,7 +212,9 @@ export default function Systems() {
     if (!orgForm.name.trim()) { setError('Company name is required'); return }
     setSaving(true); setError(''); setOkMsg('')
     try {
-      const [logo_url, banner_url] = await Promise.all([uploadIfNeeded(logoFile), uploadIfNeeded(bannerFile)])
+      const [logo_url, banner_url] = await Promise.all([uploadIfNeeded(logoFile, 'logo'), uploadIfNeeded(bannerFile, 'banner')])
+      const logoRemoved   = !logoFile   && !logoPreview   && !!org?.logo_url
+      const bannerRemoved = !bannerFile && !bannerPreview && !!org?.banner_url
       await api.put('/system/organization', {
         name:             orgForm.name.trim(),
         legal_name:       orgForm.legal_name || undefined,
@@ -212,7 +223,11 @@ export default function Systems() {
         email:            orgForm.email || undefined,
         default_timezone: orgForm.default_timezone || undefined,
         vat_rate:         orgForm.vat_rate !== '' ? Number(orgForm.vat_rate) : undefined,
-        logo_url, banner_url,
+        // '' = the user removed it (undefined would keep the old file on the server)
+        logo_url:   logoRemoved   ? '' : logo_url,
+        banner_url: bannerRemoved ? '' : banner_url,
+        // always sent so the field can be cleared
+        address:    orgForm.address,
       })
       setOkMsg('Company info saved'); load()
     } catch (e) { setError(getApiErrorMessage(e)) }
@@ -385,6 +400,13 @@ export default function Systems() {
     finally { setSaving(false) }
   }
 
+  const reopenFY = async (f: FiscalYear) => {
+    if (!window.confirm(`Reopen ${f.name}? Postings dated inside it will be allowed again (this is recorded in the activity log).`)) return
+    setError('')
+    try { await api.patch(`/system/fiscal-years/${f.id}/reopen`); load() }
+    catch (e) { setError(getApiErrorMessage(e)) }
+  }
+
   const doCloseFY = async () => {
     if (!fyToClose) return
     setSaving(true); setError('')
@@ -545,7 +567,10 @@ export default function Systems() {
             className="flex items-center gap-1.5 rounded-lg bg-rose-50 px-2.5 py-1 text-[11px] font-bold text-rose-600 hover:bg-rose-100 dark:bg-rose-500/10 dark:text-rose-400 transition-colors">
             <Lock size={11}/> Close Period
           </button>
-        : null
+        : <button onClick={()=>reopenFY(f)}
+            className="flex items-center gap-1.5 rounded-lg bg-neutral-100 px-2.5 py-1 text-[11px] font-bold text-neutral-600 hover:bg-neutral-200 dark:bg-white/[0.06] dark:text-neutral-300 transition-colors">
+            <Unlock size={11}/> Reopen
+          </button>
     )},
   ]
 
@@ -613,7 +638,7 @@ export default function Systems() {
         <div>
           <h1 className="text-[20px] font-extrabold text-neutral-900 dark:text-white">Systems</h1>
           <p className="mt-0.5 text-[13px] text-neutral-500 dark:text-neutral-400">
-            Capital <span className="font-bold text-fuchsia-600 dark:text-fuchsia-400">${totalCapital.toFixed(2)}</span>
+            Capital <span className="font-bold text-fuchsia-600 dark:text-fuchsia-400">{totalCapital < 0 ? '-' : ''}${Math.abs(totalCapital).toFixed(2)}</span>
             {' '}· Assets <span className="font-bold text-cyan-600 dark:text-cyan-400">${totalAssets.toFixed(2)}</span>
           </p>
         </div>
@@ -638,6 +663,11 @@ export default function Systems() {
           { key: 'cleaner', label: 'Account Cleaner', icon: <Eraser size={14}/> },
           { key: 'closing', label: 'Closing Period',  icon: <CalendarCheck size={14}/>, count: years.length },
           { key: 'profit',  label: 'Profit Sharing',  icon: <PieChart size={14}/>,      count: shares.length },
+          { key: 'backup',  label: 'Backup',          icon: <DatabaseBackup size={14}/> },
+          { key: 'approvals', label: 'Approvals',     icon: <ShieldCheck size={14}/> },
+          { key: 'notifications', label: 'Notifications', icon: <BellRing size={14}/> },
+          { key: 'import', label: 'Import', icon: <FileSpreadsheet size={14}/> },
+          { key: 'online', label: 'Online booking', icon: <Globe size={14}/> },
         ]}
       />
 
@@ -674,6 +704,10 @@ export default function Systems() {
                   <input type="email" value={orgForm.email} onChange={e=>setOrgForm(p=>({...p, email: e.target.value}))} className={INPUT}/>
                 </Field>
               </div>
+              <Field label="Address">
+                <input value={orgForm.address} onChange={e=>setOrgForm(p=>({...p, address: e.target.value}))}
+                  placeholder="Street, city" className={INPUT}/>
+              </Field>
               <Field label="VAT Rate (%)">
                 <input type="number" min="0" max="100" step="0.5" value={orgForm.vat_rate}
                   onChange={e=>setOrgForm(p=>({...p, vat_rate: e.target.value}))}
@@ -686,7 +720,7 @@ export default function Systems() {
 
               <div className="grid grid-cols-2 gap-3">
                 <Field label="Logo">
-                  <input ref={logoRef} type="file" accept="image/jpeg,image/png,image/webp" onChange={pickLogo} className="hidden"/>
+                  <input ref={logoRef} type="file" accept={IMAGE_ACCEPT} onChange={pickLogo} className="hidden"/>
                   {logoPreview ? (
                     <div className="flex items-center gap-3">
                       <ImageThumb src={logoPreview} className="h-16 w-16 rounded-2xl border border-neutral-200 dark:border-white/[0.08]" onClick={()=>setViewImage(logoPreview)}/>
@@ -703,7 +737,7 @@ export default function Systems() {
                   )}
                 </Field>
                 <Field label="Banner">
-                  <input ref={bannerRef} type="file" accept="image/jpeg,image/png,image/webp" onChange={pickBanner} className="hidden"/>
+                  <input ref={bannerRef} type="file" accept={IMAGE_ACCEPT} onChange={pickBanner} className="hidden"/>
                   {bannerPreview ? (
                     <div className="flex items-center gap-3">
                       <ImageThumb src={bannerPreview} className="h-16 w-28 rounded-xl border border-neutral-200 dark:border-white/[0.08]" onClick={()=>setViewImage(bannerPreview)}/>
@@ -721,8 +755,29 @@ export default function Systems() {
                 </Field>
               </div>
               <p className="-mt-2 text-[11.5px] text-neutral-400">
-                Logo shows in the sidebar and on printed receipts/invoices; banner is used on the login screen. JPG, PNG or WebP, max 15MB — automatically optimized.
+                Printed on every document: small receipts (80 mm) use the logo, A4 documents (statements, reports, dashboard) use the banner. Any picture works (JPG, PNG, WebP, GIF, SVG, AVIF · up to 25 MB) — it is resized to fit automatically, never rejected for its shape.
               </p>
+
+              {(logoPreview || bannerPreview) && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="rounded-xl border border-neutral-200 bg-neutral-50 p-3 dark:border-white/[0.08] dark:bg-white/[0.03]">
+                    <p className="mb-2 text-[10.5px] font-semibold uppercase tracking-wide text-neutral-400">A4 documents (banner)</p>
+                    <div className="rounded-lg bg-white p-2 shadow-inner">
+                      {bannerPreview
+                        ? <img src={bannerPreview} alt="" className="mx-auto block max-h-14 max-w-full object-contain"/>
+                        : <p className="py-3 text-center text-[11px] text-neutral-400">No banner — the logo and company name are used</p>}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-neutral-200 bg-neutral-50 p-3 dark:border-white/[0.08] dark:bg-white/[0.03]">
+                    <p className="mb-2 text-[10.5px] font-semibold uppercase tracking-wide text-neutral-400">Receipts 80 mm (logo)</p>
+                    <div className="rounded-lg bg-white p-2 shadow-inner">
+                      {(logoPreview || bannerPreview)
+                        ? <img src={logoPreview || bannerPreview} alt="" className="mx-auto block max-h-12 max-w-[60%] object-contain grayscale"/>
+                        : null}
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <button onClick={saveOrg} disabled={saving || !orgForm.name.trim()}
                 className="flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-2.5 text-[13px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-40 transition-colors">
@@ -774,6 +829,12 @@ export default function Systems() {
         <DataTable columns={FY_COLS} data={years} title="Closing Periods" filename="fiscal_years"
           rowKey={f=>f.id} searchPlaceholder="Search periods…" loading={loading}/>
       )}
+      {tab === 'backup' && <BackupPanel />}
+      {tab === 'approvals' && <ApprovalPolicyPanel />}
+      {tab === 'notifications' && <NotificationsPanel />}
+      {tab === 'import' && <ImportPanel />}
+      {tab === 'online' && <OnlineBookingPanel />}
+
       {tab === 'profit' && (
         <DataTable columns={SHARE_COLS} data={shares} title="Profit Sharing" filename="profit_sharing"
           rowKey={s=>s.id} searchPlaceholder="Search partner…" loading={loading}/>
@@ -945,7 +1006,15 @@ export default function Systems() {
           <p className="mt-1 text-[13px] text-neutral-500">
             {fyToClose?.start_date?.slice(0,10)} → {fyToClose?.end_date?.slice(0,10)}
           </p>
-          <p className="mt-2 text-[12px] text-rose-500">A closed period cannot be reopened.</p>
+          <p className="mt-2 text-[12px] text-rose-500">
+            Once closed, nothing dated inside this period can be posted, edited or deleted — payments, transfers, expenses and salaries included.
+            Only an administrator can reopen it.
+          </p>
+          {fyToClose && fyToClose.end_date?.slice(0, 10) >= new Date().toISOString().slice(0, 10) && (
+            <p className="mt-2 rounded-xl bg-amber-50 px-3 py-2 text-[12px] font-semibold text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+              This period has not ended yet — closing it now will block today's payments too.
+            </p>
+          )}
         </div>
       </Modal>
 

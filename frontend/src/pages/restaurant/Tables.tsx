@@ -2,11 +2,14 @@ import { useState, useMemo, useEffect, useCallback } from 'react'
 import {
   Plus, QrCode, Users, Clock, CheckCircle2, Loader2, X,
   Utensils, ChefHat, Printer, Pause, CreditCard, Minus,
-  Search, LayoutGrid, List, Banknote, Smartphone, Zap, Info, RefreshCw, Star,
+  Search, LayoutGrid, List, Banknote, Smartphone, Zap, Info, RefreshCw,
 } from 'lucide-react'
 import Modal, { INPUT, Field, CancelBtn } from '@/components/ui/Modal'
+import { printHtml, esc, companyHeader, type OrgInfo } from '@utils/print'
+import { useAuthContext } from '@/contexts/AuthContext'
 import api from '@/services/api'
 import { getApiErrorMessage } from '@/services/api'
+import { withApproval, isApprovalCancelled } from '@utils/approval'
 import type { TableOrder, OrderItem, PaymentMethod } from '@/types/restaurant'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -50,11 +53,11 @@ const recalc = (order: TableOrder): TableOrder => {
 let _orderCounter = 100
 const nextOrderNum = () => ++_orderCounter
 
-const makeOrder = (t: TableRow): TableOrder => ({
+const makeOrder = (t: TableRow, vatPct = 5): TableOrder => recalc({
   id: `ord-${Date.now()}`, orderNumber: nextOrderNum(),
   tableId: t.id, tableNumber: t.number,
   type: 'dine_in', status: 'open',
-  items: [], subtotal: 0, discountPct: 0, taxPct: 5, taxAmt: 0, total: 0,
+  items: [], subtotal: 0, discountPct: 0, taxPct: vatPct, taxAmt: 0, total: 0,
   notes: '', waiterName: '',
   createdAt: new Date().toISOString(),
 })
@@ -62,8 +65,23 @@ const makeOrder = (t: TableRow): TableOrder => ({
 // ─── QR Modal ─────────────────────────────────────────────────────────────────
 
 function QRModal({ table, onClose }: { table: TableRow; onClose: () => void }) {
-  const menuUrl = `${window.location.origin}/menu/${table.number}`
+  const [org, setOrg] = useState<OrgInfo | null>(null)
+  useEffect(() => { api.get('/system/organization').then(r => setOrg(r.data.data)).catch(() => {}) }, [])
+  const { user } = useAuthContext()
+  const branchId = user?.current_branch?.branch_id ?? user?.current_branch?.id ?? ''
+  // The link carries the BRANCH (so the page shows this restaurant's real menu) and the table number
+  const menuUrl = `${window.location.origin}/menu/${branchId}?table=${encodeURIComponent(table.number)}`
   const qrSrc   = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(menuUrl)}&size=260x260&bgcolor=ffffff&color=1a1a2e&margin=12`
+  // Prints just the QR card with the company branding — window.print() printed the whole app page
+  const printQr = () => printHtml(`
+    ${companyHeader(org)}
+    <hr/>
+    <div class="center bold lg mt">Scan to view our menu</div>
+    <div class="center mt"><img src="${esc(qrSrc)}" alt="QR" style="width:62mm;height:62mm"/></div>
+    <div class="center bold xl mt">Table ${esc(table.number)}</div>
+    <div class="center xs mt">${esc(menuUrl)}</div>
+  `, 100)
+
   return (
     <Modal open onClose={onClose} title={`QR Code — ${table.number}`} size="sm"
       footer={
@@ -72,7 +90,7 @@ function QRModal({ table, onClose }: { table: TableRow; onClose: () => void }) {
             className="flex-1 rounded-xl border border-neutral-200/60 py-2 text-[13px] font-semibold text-neutral-600 hover:bg-neutral-50 dark:border-white/[0.08] dark:text-neutral-400 transition-colors">
             Open Menu ↗
           </button>
-          <button onClick={() => window.print()}
+          <button onClick={printQr}
             className="flex-1 rounded-xl bg-orange-500 py-2 text-[13px] font-semibold text-white hover:bg-orange-600 transition-colors">
             Print QR
           </button>
@@ -123,8 +141,6 @@ function OrderPanel({
   const [showPay,    setShowPay]    = useState(false)
   const [payMethod,  setPayMethod]  = useState<PaymentMethod>('cash')
   const [amountPaid, setAmountPaid] = useState('')
-  const [guestName,  setGuestName]  = useState('')
-  const [roomNumber, setRoomNumber] = useState('')
 
   const visibleItems = useMemo(() => {
     let items = activeCat === 'all' ? menuItems : menuItems.filter(i => i.category_id === activeCat)
@@ -433,16 +449,9 @@ function OrderPanel({
               </div>
 
               {payMethod === 'room_charge' && (
-                <div className="space-y-2 rounded-xl bg-indigo-50 dark:bg-indigo-500/10 p-3">
-                  <div className="flex items-center gap-1.5 text-[11px] font-semibold text-indigo-700 dark:text-indigo-400">
-                    <Info size={12}/> Room Charge Integration
-                  </div>
-                  <input value={guestName} onChange={e => setGuestName(e.target.value)}
-                    placeholder="Guest Name"
-                    className="w-full rounded-lg border border-indigo-200 bg-white px-3 py-1.5 text-[12px] outline-none dark:border-indigo-500/20 dark:bg-white/[0.04] dark:text-white"/>
-                  <input value={roomNumber} onChange={e => setRoomNumber(e.target.value)}
-                    placeholder="Room Number"
-                    className="w-full rounded-lg border border-indigo-200 bg-white px-3 py-1.5 text-[12px] outline-none dark:border-indigo-500/20 dark:bg-white/[0.04] dark:text-white"/>
+                <div className="flex items-start gap-1.5 rounded-xl bg-indigo-50 p-3 text-[11.5px] font-semibold text-indigo-700 dark:bg-indigo-500/10 dark:text-indigo-300">
+                  <Info size={13} className="mt-px shrink-0"/>
+                  Room charge is done from the POS screen — it lists the checked-in guests so the bill lands on their statement.
                 </div>
               )}
 
@@ -461,8 +470,8 @@ function OrderPanel({
               )}
 
               <button
-                onClick={() => { onBill(payMethod, paid, guestName, roomNumber); setShowPay(false); setAmountPaid('') }}
-                disabled={payMethod === 'cash' && paid < order.total}
+                onClick={() => { onBill(payMethod, paid); setShowPay(false); setAmountPaid('') }}
+                disabled={(payMethod === 'cash' && paid < order.total) || payMethod === 'room_charge'}
                 className="w-full rounded-xl bg-orange-500 py-3 text-[13px] font-extrabold text-white hover:bg-orange-600 disabled:cursor-not-allowed disabled:opacity-40 transition-colors shadow-sm">
                 Collect ${order.total.toFixed(2)}
               </button>
@@ -564,6 +573,9 @@ export default function Tables() {
   const [selectedTable,  setSelectedTable]  = useState<TableRow | null>(null)
   const [form,           setForm]           = useState<TableForm>(EMPTY_FORM)
   const [qrTable,        setQrTable]        = useState<TableRow | null>(null)
+  // Company VAT rate and the account payments are deposited into (same sources the POS uses)
+  const [vatRate,   setVatRate]   = useState(5)
+  const [accountId, setAccountId] = useState('')
 
   const loadTables = useCallback(async () => {
     setLoadingTables(true)
@@ -597,6 +609,18 @@ export default function Tables() {
 
   useEffect(() => { loadTables(); loadMenu() }, [loadTables, loadMenu])
 
+  useEffect(() => {
+    api.get('/system/organization')
+      .then(r => { const v = Number(r.data.data?.vat_rate); if (Number.isFinite(v)) setVatRate(v) })
+      .catch(() => {})
+    api.get('/accounting/accounts')
+      .then(r => {
+        const accs: { id: string; account_type: string }[] = r.data.data
+        setAccountId(accs.find(a => a.account_type === 'cash')?.id ?? accs[0]?.id ?? '')
+      })
+      .catch(() => {})
+  }, [])
+
   const areas = useMemo(() => {
     const set = new Set(tables.map(t => t.area))
     return ['All', ...Array.from(set).sort()]
@@ -619,7 +643,7 @@ export default function Tables() {
   const handleTableClick = (t: TableRow) => {
     setActiveTableId(t.id)
     const existing = tableOrders[t.id]
-    setActiveOrder(existing ? { ...existing } : makeOrder(t))
+    setActiveOrder(existing ? { ...existing } : makeOrder(t, vatRate))
   }
 
   const closePanel = () => { setActiveTableId(null); setActiveOrder(null) }
@@ -667,8 +691,13 @@ export default function Tables() {
   }
 
   // ── Send to Kitchen ──────────────────────────────────────────────────────────
+  // Items still marked "pending" have not reached the server yet. The first send
+  // creates the order; every later send posts only the NEW items, so dishes added
+  // after the first round are no longer silently lost.
   const handleSendToKitchen = async () => {
     if (!activeOrder || !activeTableId || activeOrder.items.length === 0) return
+    const fresh = activeOrder.items.filter(i => i.status === 'pending')
+    if (fresh.length === 0) return
     setSyncing(true); setError('')
     try {
       let backendId = backendOrderIds[activeTableId]
@@ -676,16 +705,19 @@ export default function Tables() {
         const r = await api.post('/restaurant/orders', {
           dining_table_id: activeTableId,
           order_type: 'dine_in',
+          discount_amount: activeOrder.subtotal * (activeOrder.discountPct / 100),
         })
         backendId = r.data.data.id
         setBackendOrderIds(p => ({ ...p, [activeTableId]: backendId }))
-        await Promise.all(activeOrder.items.map(item =>
-          api.post(`/restaurant/orders/${backendId}/lines`, {
-            menu_item_id: item.menuItemId,
-            quantity:     item.quantity,
-          })
-        ))
       }
+      for (const item of fresh) {
+        await api.post(`/restaurant/orders/${backendId}/lines`, {
+          menu_item_id: item.menuItemId,
+          quantity:     item.quantity,
+        })
+      }
+      // Hand the order to the kitchen (stamps every pending line) — previously the order stayed "open" forever
+      await api.patch(`/restaurant/orders/${backendId}/status`, { status: 'preparing' })
       await api.patch(`/restaurant/tables/${activeTableId}/status`, { status: 'occupied' })
 
       const now = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
@@ -713,15 +745,31 @@ export default function Tables() {
   }
 
   // ── Bill ─────────────────────────────────────────────────────────────────────
-  const handleBill = async (_method: string, _paid: number, _guestName?: string, _roomNumber?: string) => {
+  // Creates the invoice AND records the payment into the cash account. This used to
+  // only "close" the order — the sale was never invoiced and no money reached the
+  // books. The server finishes the order and frees the table once it is fully paid.
+  const handleBill = async (method: string, _paid: number, _guestName?: string, _roomNumber?: string) => {
     if (!activeOrder || !activeTableId) return
     setSyncing(true); setError('')
     try {
       const backendId = backendOrderIds[activeTableId]
-      if (backendId) {
-        await api.patch(`/restaurant/orders/${backendId}/close`)
+      if (!backendId) throw new Error('Send the order to the kitchen first — there is nothing to bill yet.')
+      if (method === 'room_charge') {
+        throw new Error('Room charge must be started from the POS screen, where you pick the checked-in guest.')
       }
-      await api.patch(`/restaurant/tables/${activeTableId}/status`, { status: 'cleaning' })
+      if (!accountId) throw new Error('No cash/bank account is set up — add one in Finance → Accounts before taking payments.')
+
+      // A discount above the manager-approval limit asks for a manager's PIN before the bill is made
+      const bill = await withApproval(body => api.post(`/restaurant/orders/${backendId}/bill`, {
+        discount_amount: activeOrder.subtotal * (activeOrder.discountPct / 100), ...body,
+      }))
+      const invoice = bill.data.data
+      await api.post(`/accounting/invoices/${invoice.id}/payment`, {
+        amount: Number(invoice.total_amount),
+        payment_method: method,
+        account_id: accountId,
+      })
+      await api.patch(`/restaurant/tables/${activeTableId}/status`, { status: 'cleaning' }).catch(() => {})
 
       setTableOrders(p => { const n = { ...p }; delete n[activeTableId]; return n })
       setBackendOrderIds(p => { const n = { ...p }; delete n[activeTableId]; return n })
@@ -730,7 +778,7 @@ export default function Tables() {
         : t))
       setActiveTableId(null)
       setActiveOrder(null)
-    } catch (e) { setError(getApiErrorMessage(e)) }
+    } catch (e) { if (!isApprovalCancelled(e)) setError(getApiErrorMessage(e)) }
     finally { setSyncing(false) }
   }
 

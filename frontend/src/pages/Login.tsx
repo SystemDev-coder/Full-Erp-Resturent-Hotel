@@ -1,7 +1,8 @@
 import { useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
-import { AlertCircle, Eye, EyeOff, Lock, Mail, Moon, Sun, Building2 } from 'lucide-react'
+import { AlertCircle, Eye, EyeOff, Lock, Mail, Moon, Sun, Building2, ShieldCheck, ArrowLeft } from 'lucide-react'
+import axios from 'axios'
 import { useAuth } from '../hooks/useAuth'
 import { useTheme } from '../contexts/ThemeContext'
 import { useLanguage } from '../contexts/LanguageContext'
@@ -38,7 +39,11 @@ export default function Login() {
   const [shake, setShake] = useState(0)
 
   const navigate = useNavigate()
-  const { login } = useAuth()
+  const { login, verifyTwoFactor } = useAuth()
+  // two-factor: after the password, the account may ask for the 6-digit code from the authenticator app
+  const [challenge, setChallenge] = useState<string | null>(null)
+  const [code, setCode] = useState('')
+  const codeRef = useRef<HTMLInputElement>(null)
   const { theme, toggleTheme } = useTheme()
   const { t } = useLanguage()
 
@@ -60,7 +65,8 @@ export default function Login() {
     }
     setLoading(true); setError('')
     try {
-      await login({ email: email.trim(), password })
+      const r = await login({ email: email.trim(), password })
+      if (r?.challenge) { setChallenge(r.challenge); setCode(''); setTimeout(() => codeRef.current?.focus(), 150); return }
       navigate('/dashboard', { replace: true })
     } catch (e) {
       setError(getApiErrorMessage(e, t('login.invalid')))
@@ -71,11 +77,25 @@ export default function Login() {
     } finally { setLoading(false) }
   }
 
+  const submitCode = async () => {
+    if (!challenge || code.trim().length < 6) { setError('Type the 6-digit code from your authenticator app.'); return }
+    setLoading(true); setError('')
+    try {
+      await verifyTwoFactor(challenge, code.trim())
+      navigate('/dashboard', { replace: true })
+    } catch (e) {
+      setError(getApiErrorMessage(e, 'That code is not right.')); setShake(k => k + 1); setCode('')
+      // the sign-in expired or the account got locked → back to the password step
+      if (axios.isAxiosError(e) && (e.response?.data as { data?: { restart?: boolean } } | undefined)?.data?.restart) { setChallenge(null); setPassword('') }
+      else setTimeout(() => codeRef.current?.focus(), 150)
+    } finally { setLoading(false) }
+  }
+
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-neutral-50 px-4 py-8 text-neutral-900 dark:bg-[#0b0b0c] dark:text-white">
       <CircuitFrame />
       <button
-        onClick={toggleTheme}
+        onClick={(e) => toggleTheme({ x: e.clientX, y: e.clientY })}
         aria-label="Toggle theme"
         className="absolute right-5 top-5 z-10 flex h-9 w-9 items-center justify-center rounded-lg border border-neutral-200 bg-white text-neutral-500 shadow-sm transition-colors hover:border-sky-400 hover:text-sky-600 dark:border-white/10 dark:bg-white/[0.04] dark:text-neutral-400 dark:hover:border-sky-400/40 dark:hover:text-white"
       >
@@ -95,7 +115,7 @@ export default function Login() {
 
         <div className="text-center">
           <h1 className="text-[25px] font-extrabold tracking-tight text-neutral-950 dark:text-white">Welcome Back</h1>
-          <p className="mt-3 text-[13px] text-neutral-500 dark:text-neutral-400">Sign in to continue to Hospitality ERP</p>
+          <p className="mt-3 text-[13px] text-neutral-500 dark:text-neutral-400">{challenge ? 'Enter the code from your authenticator app' : 'Sign in to continue to Hospitality ERP'}</p>
         </div>
 
         <AnimatePresence mode="wait">
@@ -107,6 +127,22 @@ export default function Login() {
           )}
         </AnimatePresence>
 
+        {challenge ? (
+          <div className="mt-8 space-y-4">
+            <div className="relative">
+              <ShieldCheck size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-neutral-400 dark:text-neutral-500" />
+              <input ref={codeRef} value={code} inputMode="text" autoComplete="one-time-code" placeholder="123456" maxLength={11} disabled={loading} autoFocus
+                onChange={e => { setCode(e.target.value.replace(/[^a-zA-Z0-9 -]/g, '')); setError('') }} onKeyDown={e => e.key === 'Enter' && submitCode()}
+                className="h-12 w-full rounded-lg border border-neutral-200 bg-neutral-50 pl-12 pr-4 text-center text-[18px] font-bold tracking-[0.35em] text-neutral-950 outline-none transition focus:border-sky-500/70 focus:ring-4 focus:ring-sky-500/10 disabled:opacity-60 dark:border-white/10 dark:bg-[#101011] dark:text-white" />
+            </div>
+            <p className="text-center text-[11.5px] text-neutral-400">Lost your phone? Type one of your recovery codes instead (like <span className="font-mono">k3f9a-72xmp</span>).</p>
+            <button onClick={submitCode} disabled={loading}
+              className="flex h-12 w-full items-center justify-center rounded-lg bg-sky-600 text-[14px] font-bold text-white shadow-lg shadow-sky-950/20 transition hover:bg-sky-500 active:scale-[0.99] disabled:opacity-60">
+              {loading ? <span className="h-5 w-5 animate-spin rounded-full border-2 border-white/30 border-t-white" /> : 'Verify & sign in'}
+            </button>
+            <button onClick={() => { setChallenge(null); setCode(''); setError(''); setPassword('') }} className="mx-auto flex items-center gap-1.5 text-[12px] font-medium text-neutral-500 hover:text-sky-600"><ArrowLeft size={13} /> Back to password</button>
+          </div>
+        ) : (<>
         <div className="mt-8 space-y-4">
           <div className="relative">
             <Mail size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-neutral-400 dark:text-neutral-500" />
@@ -129,6 +165,7 @@ export default function Login() {
           className="mt-6 flex h-12 w-full items-center justify-center rounded-lg bg-sky-600 text-[14px] font-bold text-white shadow-lg shadow-sky-950/20 transition hover:bg-sky-500 active:scale-[0.99] disabled:opacity-60">
           {loading ? <span className="h-5 w-5 animate-spin rounded-full border-2 border-white/30 border-t-white" /> : 'Login'}
         </button>
+        </>)}
 
         <div className="mt-5 rounded-lg border border-sky-100 bg-sky-50 px-3 py-2 text-[12px] text-sky-800 dark:border-sky-500/15 dark:bg-sky-500/10 dark:text-sky-200">
           Admin: admin@mogadishugrand.so / Admin@1234

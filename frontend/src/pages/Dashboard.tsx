@@ -1,557 +1,179 @@
-import { useState, useEffect } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  AreaChart, Area, BarChart, Bar,
-  PieChart, Pie, Cell,
-  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
+  Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts'
 import {
-  TrendingUp, BedDouble, UtensilsCrossed,
-  Banknote, Gauge, ArrowUpRight, ArrowDownRight,
-  Clock, CheckCircle2, AlertCircle, Loader2, CalendarDays, Sparkles, SunMedium, MoonStar, Coffee,
-  Hotel, ChefHat, Table2, Receipt, Hourglass, UserCircle2,
+  Activity, ArrowDownRight, ArrowUpRight, BedDouble, ChefHat, CircleDollarSign, Clock, Coffee,
+  ConciergeBell, DoorOpen, FileText, Gauge, Hotel, KeyRound, LogIn, LogOut, MoonStar, PackageSearch,
+  Printer, Receipt, RefreshCw, Soup, SprayCan, SunMedium, TrendingUp, UtensilsCrossed,
 } from 'lucide-react'
 import { useAuthContext } from '@/contexts/AuthContext'
 import { roleHasModule } from '@/config/rolePermissions'
-import api from '@/services/api'
+import { DetailModal } from '@/components/ui/DetailModal'
+import { TONES, type ToneKey } from '@utils/tones'
+import api, { getApiErrorMessage } from '@/services/api'
+import { printSections } from '@utils/printDetail'
 
-function greetingInfo() {
-  const now = new Date()
-  const h = now.getHours()
-  const day = now.getDay()
-  const title = h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening'
-  const dayMessages = [
-    'A peaceful Sunday to review, reset, and welcome every guest well.',
-    'Fresh Monday energy - a strong start for smooth operations.',
-    'Happy Tuesday - keep the service steady and the details sharp.',
-    'Wonderful Wednesday - half the week is yours to win.',
-    'Thoughtful Thursday - a great day to tighten every workflow.',
-    'Beautiful Friday - may every booking, order, and guest moment flow smoothly.',
-    'A calm Saturday shift - perfect for warm hospitality and clean execution.',
-  ]
-  const Icon = day === 5 ? Sparkles : h < 12 ? SunMedium : h < 17 ? Coffee : MoonStar
-  return { title, message: dayMessages[day], Icon }
-}
-function firstName(fullName?: string) { return fullName?.split(' ')[0] ?? 'there' }
+// ─── Data shape (GET /dashboard/summary) ──────────────────────────────────────
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-interface DashStats {
-  today_revenue: number
-  active_bookings: number
-  order_count: number
-  order_revenue: number
-  total_rooms: number
-  occupied_rooms: number
-  occupancy_pct: number
+interface Summary {
+  generated_at: string
+  collected: { today: number; yesterday: number; delta: number | null; hotel: number; restaurant: number; other: number }
+  room_revenue: { today: number; yesterday: number; delta: number | null }
+  restaurant: {
+    sales_today: number; sales_delta: number | null; orders_today: number; orders_delta: number | null
+    live_orders: number; avg_ticket: number
+  }
+  rooms: {
+    total: number; occupied: number; occupancy_pct: number; by_status: { status: string; count: number }[]
+    arrivals: number; departures: number; in_house: number
+  }
+  housekeeping: { open: number; done: number; tasks: { id: string; task_type: string; status: string; room_number: string; assigned_to_name?: string }[] }
+  outstanding: { due: number; count: number }
+  low_stock: number
+  series: { date: string; hotel: number; restaurant: number; other: number }[]
+  top_items: { name: string; qty: number; revenue: number }[]
+  recent_bookings: { id: string; booking_ref: string; status: string; check_in_date: string; check_out_date: string; total_amount: string; guest_name: string; room_number: string }[]
+  recent_orders: { id: string; order_ref: string; status: string; total_amount: string; opened_at: string; table_number?: string; order_type: string }[]
 }
 
-interface OccupancyRow { status: string; count: string }
-interface BookingRow   { id: string; reference_number: string; check_in_date: string; check_out_date: string; status: string; total_amount: string; guest_name?: string; room_number?: string }
-interface OrderRow     { id: string; order_number: string; status: string; total_amount: string; created_at: string }
-interface HKRow        { id: string; task_type: string; status: string; room_number: string; assigned_to_name?: string }
+// ─── Pastel design tokens (shared with the report tabs) ───────────────────────
 
-// ─── Color helpers ────────────────────────────────────────────────────────────
-
-type StatColor = 'indigo' | 'emerald' | 'amber' | 'rose' | 'sky' | 'violet'
-const COLOR_MAP: Record<StatColor, { bg: string; icon: string; ring: string }> = {
-  indigo:  { bg: 'bg-indigo-50 dark:bg-indigo-500/10',  icon: 'text-indigo-600 dark:text-indigo-400',  ring: 'ring-indigo-100 dark:ring-indigo-500/20'  },
-  emerald: { bg: 'bg-emerald-50 dark:bg-emerald-500/10',icon: 'text-emerald-600 dark:text-emerald-400',ring: 'ring-emerald-100 dark:ring-emerald-500/20' },
-  amber:   { bg: 'bg-amber-50 dark:bg-amber-500/10',    icon: 'text-amber-600 dark:text-amber-400',    ring: 'ring-amber-100 dark:ring-amber-500/20'    },
-  rose:    { bg: 'bg-rose-50 dark:bg-rose-500/10',      icon: 'text-rose-600 dark:text-rose-400',      ring: 'ring-rose-100 dark:ring-rose-500/20'      },
-  sky:     { bg: 'bg-sky-50 dark:bg-sky-500/10',        icon: 'text-sky-600 dark:text-sky-400',        ring: 'ring-sky-100 dark:ring-sky-500/20'        },
-  violet:  { bg: 'bg-violet-50 dark:bg-violet-500/10',  icon: 'text-violet-600 dark:text-violet-400',  ring: 'ring-violet-100 dark:ring-violet-500/20'  },
+const CHART = { hotel: '#9cc8f5', restaurant: '#f7b98a', other: '#c4b5f5' }
+const ROOM_COLOR: Record<string, string> = {
+  available: '#8fd4b0', occupied: '#8bb8f0', cleaning: '#f2d479', maintenance: '#f0a0b0', out_of_order: '#c3c9d4',
+}
+const STATUS_TONE: Record<string, ToneKey> = {
+  confirmed: 'sky', pending: 'butter', checked_in: 'mint', checked_out: 'lilac', cancelled: 'rose', no_show: 'rose',
+  open: 'sky', preparing: 'butter', ready: 'lilac', served: 'mint', billed: 'peach', paid: 'mint',
+  in_progress: 'butter', completed: 'mint', inspected: 'mint', skipped: 'rose',
 }
 
-function StatCard({ label, value, sub, change, icon: Icon, color, loading }: {
-  label: string; value: string; sub?: string; change: number; icon: React.ElementType; color: StatColor; loading?: boolean
+// ─── Small helpers ────────────────────────────────────────────────────────────
+
+const money = (n: number) =>
+  (n < 0 ? '-$' : '$') + Math.abs(Number(n)).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 })
+
+const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+const shortDay = (iso: string) => { const d = new Date(iso + 'T00:00:00'); return `${DAYS[d.getDay()]} ${d.getDate()}` }
+const shortDate = (iso: string) => { const d = new Date(iso.slice(0, 10) + 'T00:00:00'); return `${d.getDate()} ${MON[d.getMonth()]}` }
+const timeOf = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+
+function greeting() {
+  const h = new Date().getHours()
+  if (h < 12) return { text: 'Good Morning',   Icon: SunMedium }
+  if (h < 17) return { text: 'Good Afternoon', Icon: Coffee }
+  return { text: 'Good Evening', Icon: MoonStar }
+}
+
+function StatusPill({ status }: { status: string }) {
+  return (
+    <span className={`inline-block rounded-full px-2.5 py-0.5 text-[11px] font-semibold capitalize ${TONES[STATUS_TONE[status] ?? 'sky'].soft}`}>
+      {status.replace(/_/g, ' ')}
+    </span>
+  )
+}
+
+// ─── Building blocks ──────────────────────────────────────────────────────────
+
+function KpiCard({ tone, icon: Icon, label, value, sub, delta, onClick, loading }: {
+  tone: ToneKey; icon: React.ElementType; label: string; value: string; sub?: string
+  delta?: number | null; onClick: () => void; loading: boolean
 }) {
-  const c = COLOR_MAP[color]
-  const up = change >= 0
+  const t = TONES[tone]
   return (
-    <div className="rounded-2xl border border-neutral-200/60 bg-white p-5 shadow-sm dark:border-white/[0.06] dark:bg-[#1c2333]">
+    <button type="button" onClick={onClick}
+      className={`group relative flex flex-col rounded-3xl border p-5 text-left transition duration-200 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/[0.06] focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300 ${t.card}`}>
       <div className="flex items-start justify-between">
-        <div className={`flex h-11 w-11 items-center justify-center rounded-xl ${c.bg} ring-1 ${c.ring}`}>
-          <Icon size={20} className={c.icon} />
-        </div>
-        <span className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-bold ${
-          up ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-400'
-             : 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-400'
-        }`}>
-          {up ? <ArrowUpRight size={11}/> : <ArrowDownRight size={11}/>}
-          {Math.abs(change)}%
-        </span>
+        <span className={`flex h-11 w-11 items-center justify-center rounded-2xl ${t.chip}`}><Icon size={21} strokeWidth={2} /></span>
+        <ArrowUpRight size={16} className={`opacity-0 transition group-hover:opacity-70 ${t.ink}`} />
       </div>
-      {loading ? (
-        <div className="mt-4 h-7 w-24 animate-pulse rounded-lg bg-neutral-100 dark:bg-white/[0.06]" />
-      ) : (
-        <p className="mt-4 text-[26px] font-extrabold leading-none tracking-tight text-neutral-900 dark:text-white">{value}</p>
-      )}
-      <p className="mt-1.5 text-[13px] font-medium text-neutral-500 dark:text-neutral-400">{label}</p>
-      {sub && <p className="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">{sub}</p>}
-    </div>
+      <p className={`mt-5 text-[12.5px] font-medium opacity-80 ${t.ink}`}>{label}</p>
+      {loading
+        ? <span className="mt-1.5 h-8 w-28 animate-pulse rounded-lg bg-black/[0.06] dark:bg-white/[0.08]" />
+        : <p className={`mt-0.5 text-[30px] font-bold leading-tight tracking-tight tabular-nums ${t.ink}`}>{value}</p>}
+      <div className="mt-1.5 flex min-h-[22px] flex-wrap items-center gap-2">
+        {delta != null && !loading && (
+          <span className={`flex items-center gap-0.5 rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+            delta >= 0 ? 'bg-white/70 text-[#1d6b48] dark:bg-white/10 dark:text-[#8fe0b8]' : 'bg-white/70 text-[#a13350] dark:bg-white/10 dark:text-[#f3a1b3]'}`}>
+            {delta >= 0 ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}{Math.abs(delta)}%
+          </span>
+        )}
+        {sub && <span className={`text-[11.5px] opacity-70 ${t.ink}`}>{sub}</span>}
+      </div>
+    </button>
   )
 }
 
-const BOOKING_BADGE: Record<string, string> = {
-  confirmed:   'bg-indigo-100 text-indigo-700 dark:bg-indigo-500/20 dark:text-indigo-300',
-  checked_in:  'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300',
-  checked_out: 'bg-neutral-100 text-neutral-500 dark:bg-neutral-700 dark:text-neutral-400',
-  cancelled:   'bg-rose-100 text-rose-700 dark:bg-rose-500/20 dark:text-rose-300',
-  pending:     'bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300',
-}
-const ORDER_BADGE: Record<string, string> = {
-  open:      'bg-sky-100 text-sky-700 dark:bg-sky-500/20 dark:text-sky-300',
-  preparing: 'bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300',
-  ready:     'bg-violet-100 text-violet-700 dark:bg-violet-500/20 dark:text-violet-300',
-  served:    'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300',
-  billed:    'bg-indigo-100 text-indigo-700 dark:bg-indigo-500/20 dark:text-indigo-300',
-  paid:      'bg-neutral-100 text-neutral-500 dark:bg-neutral-700 dark:text-neutral-400',
-  cancelled: 'bg-rose-100 text-rose-700 dark:bg-rose-500/20 dark:text-rose-300',
-}
-const HK_BADGE: Record<string, { cls: string; icon: React.ReactNode }> = {
-  completed:   { cls: 'text-emerald-600 dark:text-emerald-400', icon: <CheckCircle2 size={13}/> },
-  in_progress: { cls: 'text-amber-600 dark:text-amber-400',     icon: <Loader2 size={13} className="animate-spin"/> },
-  pending:     { cls: 'text-neutral-400 dark:text-neutral-500', icon: <Clock size={13}/> },
-  skipped:     { cls: 'text-rose-500 dark:text-rose-400',       icon: <AlertCircle size={13}/> },
-}
-
-const STATUS_COLOR_PIE: Record<string, string> = {
-  available:   '#10b981',
-  occupied:    '#6366f1',
-  cleaning:    '#f59e0b',
-  maintenance: '#ef4444',
-  out_of_order:'#6b7280',
-}
-
-const CustomTooltip = ({ active, payload, label }: any) => {
-  if (!active || !payload?.length) return null
+function Glance({ tone, icon: Icon, label, value, onClick }: {
+  tone: ToneKey; icon: React.ElementType; label: string; value: string | number; onClick: () => void
+}) {
+  const t = TONES[tone]
   return (
-    <div className="rounded-xl border border-neutral-200/60 bg-white px-3 py-2.5 shadow-lg dark:border-white/[0.08] dark:bg-[#1e2a3a]">
-      <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-neutral-400">{label}</p>
-      {payload.map((p: any) => (
-        <div key={p.name} className="flex items-center gap-2 text-[12px]">
-          <span className="h-2 w-2 rounded-full" style={{ background: p.color }}/>
-          <span className="capitalize text-neutral-600 dark:text-neutral-300">{p.name}:</span>
-          <span className="font-bold text-neutral-800 dark:text-white">${p.value?.toLocaleString?.() ?? p.value}</span>
+    <button type="button" onClick={onClick}
+      className="group flex items-center gap-3 rounded-2xl border border-neutral-200/70 bg-white px-4 py-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300 dark:border-white/[0.06] dark:bg-[#1a2030]">
+      <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${t.chip}`}><Icon size={17} /></span>
+      <span className="min-w-0">
+        <span className="block truncate text-[11.5px] font-medium text-neutral-500 dark:text-neutral-400">{label}</span>
+        <span className="block text-[18px] font-bold leading-tight tabular-nums text-neutral-900 dark:text-white">{value}</span>
+      </span>
+    </button>
+  )
+}
+
+function Panel({ title, subtitle, action, children, className = '' }: {
+  title: string; subtitle?: string; action?: React.ReactNode; children: React.ReactNode; className?: string
+}) {
+  return (
+    <section className={`rounded-3xl border border-neutral-200/70 bg-white p-5 shadow-sm dark:border-white/[0.06] dark:bg-[#1a2030] ${className}`}>
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-[15px] font-bold tracking-tight text-neutral-900 dark:text-white">{title}</h3>
+          {subtitle && <p className="mt-0.5 text-[12px] text-neutral-400">{subtitle}</p>}
         </div>
-      ))}
-    </div>
-  )
-}
-
-function Card({ title, link, children }: { title: string; link?: string; children: React.ReactNode }) {
-  return (
-    <div className="rounded-2xl border border-neutral-200/60 bg-white p-5 shadow-sm dark:border-white/[0.06] dark:bg-[#1c2333]">
-      <div className="mb-5 flex items-center justify-between">
-        <h3 className="text-[14px] font-bold text-neutral-800 dark:text-white">{title}</h3>
-        {link && <Link to={link} className="text-[12px] font-semibold text-indigo-600 hover:text-indigo-700 dark:text-indigo-400">View all →</Link>}
+        {action}
       </div>
       {children}
-    </div>
+    </section>
   )
 }
 
-// ─── Tab: Overview ────────────────────────────────────────────────────────────
+const LinkBtn = ({ to, children }: { to: string; children: React.ReactNode }) => (
+  <Link to={to} className="flex items-center gap-1 rounded-xl px-2.5 py-1.5 text-[12px] font-semibold text-indigo-600 transition hover:bg-indigo-50 dark:text-indigo-300 dark:hover:bg-white/[0.06]">
+    {children} <ArrowUpRight size={12} />
+  </Link>
+)
+const TextBtn = ({ onClick, children }: { onClick: () => void; children: React.ReactNode }) => (
+  <button onClick={onClick} className="flex items-center gap-1 rounded-xl px-2.5 py-1.5 text-[12px] font-semibold text-indigo-600 transition hover:bg-indigo-50 dark:text-indigo-300 dark:hover:bg-white/[0.06]">
+    {children} <ArrowUpRight size={12} />
+  </button>
+)
 
-function OverviewTab({ stats, occupancy, bookings, orders, hkTasks, loading }: {
-  stats: DashStats | null; occupancy: OccupancyRow[]; bookings: BookingRow[]
-  orders: OrderRow[]; hkTasks: HKRow[]; loading: boolean
-}) {
-  const pieData = occupancy.map(r => ({
-    name: r.status.charAt(0).toUpperCase() + r.status.slice(1),
-    value: Number(r.count),
-    color: STATUS_COLOR_PIE[r.status] ?? '#94a3b8',
-  }))
+const Empty = ({ icon: Icon, text }: { icon: React.ElementType; text: string }) => (
+  <div className="flex flex-col items-center gap-2 py-9 text-neutral-400">
+    <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-neutral-100 dark:bg-white/[0.05]"><Icon size={20} /></span>
+    <p className="text-[12.5px]">{text}</p>
+  </div>
+)
 
-  const totalRev = (stats?.today_revenue ?? 0) + (stats?.order_revenue ?? 0)
-
-  // Placeholder 7-day bars (backend doesn't have a revenue series yet — we use today's data)
-  const revChartData = [
-    { day: 'Mon', hotel: 0, restaurant: 0 },
-    { day: 'Tue', hotel: 0, restaurant: 0 },
-    { day: 'Wed', hotel: 0, restaurant: 0 },
-    { day: 'Thu', hotel: 0, restaurant: 0 },
-    { day: 'Fri', hotel: 0, restaurant: 0 },
-    { day: 'Sat', hotel: 0, restaurant: 0 },
-    { day: 'Today', hotel: stats?.today_revenue ?? 0, restaurant: stats?.order_revenue ?? 0 },
-  ]
-
+const ChartTip = ({ active, payload, label }: any) => {
+  if (!active || !payload?.length) return null
+  const total = payload.reduce((a: number, p: any) => a + Number(p.value || 0), 0)
   return (
-    <div className="space-y-6">
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard loading={loading} label="Today's Revenue"   value={`$${totalRev.toLocaleString()}`}
-          sub={`Hotel $${stats?.today_revenue ?? 0} · Restaurant $${stats?.order_revenue ?? 0}`}
-          change={12.5} icon={Banknote} color="indigo" />
-        <StatCard loading={loading} label="Active Bookings"   value={String(stats?.active_bookings ?? 0)}
-          sub="Live hotel reservations" change={8.3} icon={BedDouble} color="sky" />
-        <StatCard loading={loading} label="Restaurant Orders" value={String(stats?.order_count ?? 0)}
-          sub={`$${stats?.order_revenue ?? 0} revenue today`} change={-2.1} icon={Receipt} color="amber" />
-        <StatCard loading={loading} label="Occupancy Rate"    value={`${stats?.occupancy_pct ?? 0}%`}
-          sub={`${stats?.occupied_rooms ?? 0} / ${stats?.total_rooms ?? 0} rooms`}
-          change={3.4} icon={Gauge} color="emerald" />
-      </div>
-
-      <div className="grid grid-cols-1 gap-5 xl:grid-cols-3">
-        <div className="col-span-1 xl:col-span-2 rounded-2xl border border-neutral-200/60 bg-white p-5 shadow-sm dark:border-white/[0.06] dark:bg-[#1c2333]">
-          <div className="mb-5 flex items-start justify-between">
-            <div>
-              <h3 className="text-[14px] font-bold text-neutral-800 dark:text-white">Revenue Overview</h3>
-              <p className="mt-0.5 text-[12px] text-neutral-400">This week · Hotel + Restaurant</p>
-            </div>
-            <div className="flex items-center gap-1.5 rounded-lg border border-neutral-200/60 bg-neutral-50 px-3 py-1.5 dark:border-white/[0.06] dark:bg-white/[0.04]">
-              <TrendingUp size={13} className="text-emerald-500"/>
-              <span className="text-[12px] font-bold text-emerald-600 dark:text-emerald-400">Live</span>
-            </div>
-          </div>
-          <div className="h-[220px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={revChartData} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="hg" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%"  stopColor="#6366f1" stopOpacity={0.25}/>
-                    <stop offset="95%" stopColor="#6366f1" stopOpacity={0}/>
-                  </linearGradient>
-                  <linearGradient id="rg" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%"  stopColor="#f59e0b" stopOpacity={0.25}/>
-                    <stop offset="95%" stopColor="#f59e0b" stopOpacity={0}/>
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-neutral-100 dark:text-white/[0.05]" vertical={false}/>
-                <XAxis dataKey="day" tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false}/>
-                <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false}/>
-                <Tooltip content={<CustomTooltip/>}/>
-                <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '12px' }}/>
-                <Area type="monotone" dataKey="hotel"      name="Hotel"      stroke="#6366f1" strokeWidth={2.5} fill="url(#hg)" dot={false} activeDot={{ r: 4 }}/>
-                <Area type="monotone" dataKey="restaurant" name="Restaurant" stroke="#f59e0b" strokeWidth={2.5} fill="url(#rg)" dot={false} activeDot={{ r: 4 }}/>
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
+    <div className="rounded-2xl border border-neutral-200/70 bg-white px-3.5 py-3 shadow-xl dark:border-white/[0.08] dark:bg-[#232b3e]">
+      <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-neutral-400">{label}</p>
+      {payload.map((p: any) => (
+        <div key={p.dataKey} className="flex items-center gap-2 text-[12px]">
+          <span className="h-2.5 w-2.5 rounded-full" style={{ background: p.fill }} />
+          <span className="capitalize text-neutral-500 dark:text-neutral-300">{p.dataKey}</span>
+          <span className="ml-auto font-semibold tabular-nums text-neutral-800 dark:text-white">{money(p.value)}</span>
         </div>
-
-        <div className="rounded-2xl border border-neutral-200/60 bg-white p-5 shadow-sm dark:border-white/[0.06] dark:bg-[#1c2333]">
-          <h3 className="mb-4 text-[14px] font-bold text-neutral-800 dark:text-white">Room Status</h3>
-          {pieData.length > 0 ? (
-            <>
-              <div className="h-[160px]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie data={pieData} cx="50%" cy="50%" innerRadius={48} outerRadius={72} paddingAngle={3} dataKey="value">
-                      {pieData.map((e, i) => <Cell key={i} fill={e.color} stroke="transparent"/>)}
-                    </Pie>
-                    <Tooltip formatter={(v, n) => [`${v} rooms`, n]} contentStyle={{ borderRadius: 10, fontSize: 12 }}/>
-                  </PieChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="mt-3 space-y-2">
-                {pieData.map(r => (
-                  <div key={r.name} className="flex items-center justify-between text-[12.5px]">
-                    <div className="flex items-center gap-2">
-                      <span className="h-2.5 w-2.5 rounded-full" style={{ background: r.color }}/>
-                      <span className="text-neutral-600 dark:text-neutral-300">{r.name}</span>
-                    </div>
-                    <span className="font-bold text-neutral-800 dark:text-white">{r.value}</span>
-                  </div>
-                ))}
-              </div>
-            </>
-          ) : (
-            <div className="flex h-[180px] items-center justify-center text-neutral-400 text-sm">Loading…</div>
-          )}
-        </div>
+      ))}
+      <div className="mt-1.5 flex justify-between border-t border-neutral-100 pt-1.5 text-[12px] font-bold dark:border-white/[0.08]">
+        <span className="text-neutral-500">Total</span><span className="tabular-nums text-neutral-900 dark:text-white">{money(total)}</span>
       </div>
-
-      <div className="grid grid-cols-1 gap-5 xl:grid-cols-5">
-        {/* Recent Bookings */}
-        <div className="col-span-1 xl:col-span-3 rounded-2xl border border-neutral-200/60 bg-white p-5 shadow-sm dark:border-white/[0.06] dark:bg-[#1c2333]">
-          <div className="mb-4 flex items-center justify-between">
-            <h3 className="text-[14px] font-bold text-neutral-800 dark:text-white">Recent Bookings</h3>
-            <Link to="/hotel/bookings" className="text-[12px] font-semibold text-indigo-600 dark:text-indigo-400">View all →</Link>
-          </div>
-          {loading ? (
-            <div className="space-y-3">{[...Array(4)].map((_,i)=><div key={i} className="h-8 animate-pulse rounded-lg bg-neutral-100 dark:bg-white/[0.05]"/>)}</div>
-          ) : bookings.length === 0 ? (
-            <p className="text-center text-[13px] text-neutral-400 py-6">No bookings yet</p>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-[12.5px]">
-                <thead>
-                  <tr className="border-b border-neutral-100 dark:border-white/[0.05]">
-                    {['Ref','Guest','Room','Check-in','Status'].map(h=>(
-                      <th key={h} className="pb-3 pr-3 text-left font-semibold text-neutral-400 whitespace-nowrap">{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-neutral-50 dark:divide-white/[0.03]">
-                  {bookings.slice(0,5).map(b=>(
-                    <tr key={b.id} className="hover:bg-neutral-50/60 dark:hover:bg-white/[0.02]">
-                      <td className="py-3 pr-3 font-mono font-bold text-indigo-600 dark:text-indigo-400 whitespace-nowrap">{b.reference_number}</td>
-                      <td className="py-3 pr-3 font-medium text-neutral-800 dark:text-neutral-200 whitespace-nowrap">{b.guest_name ?? '—'}</td>
-                      <td className="py-3 pr-3 text-neutral-500 whitespace-nowrap">{b.room_number ?? '—'}</td>
-                      <td className="py-3 pr-3 text-neutral-500 whitespace-nowrap">{b.check_in_date?.slice(0,10)}</td>
-                      <td className="py-3">
-                        <span className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold capitalize ${BOOKING_BADGE[b.status]??''}`}>
-                          {b.status.replace('_',' ')}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-
-        {/* Recent Orders */}
-        <div className="col-span-1 xl:col-span-2 rounded-2xl border border-neutral-200/60 bg-white p-5 shadow-sm dark:border-white/[0.06] dark:bg-[#1c2333]">
-          <div className="mb-4 flex items-center justify-between">
-            <h3 className="text-[14px] font-bold text-neutral-800 dark:text-white">Latest Orders</h3>
-            <Link to="/restaurant/orders" className="text-[12px] font-semibold text-indigo-600 dark:text-indigo-400">View all →</Link>
-          </div>
-          {orders.length === 0 && !loading ? (
-            <p className="text-center text-[13px] text-neutral-400 py-6">No orders today</p>
-          ) : (
-            <div className="space-y-3">
-              {orders.slice(0,5).map(o=>(
-                <div key={o.id} className="flex items-center gap-3 rounded-xl border border-neutral-100 p-3 hover:bg-amber-50/30 dark:border-white/[0.05] dark:hover:bg-amber-500/[0.04] transition-colors">
-                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-100 dark:bg-amber-500/15">
-                    <UtensilsCrossed size={14} className="text-amber-600 dark:text-amber-400"/>
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-baseline justify-between gap-2">
-                      <p className="text-[12.5px] font-bold text-neutral-800 dark:text-neutral-200">{o.order_number}</p>
-                      <p className="text-[12.5px] font-bold text-neutral-800 dark:text-white">${Number(o.total_amount).toFixed(2)}</p>
-                    </div>
-                    <div className="mt-0.5 flex items-center justify-between">
-                      <p className="text-[11.5px] text-neutral-400">{new Date(o.created_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</p>
-                      <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold capitalize ${ORDER_BADGE[o.status]??''}`}>{o.status}</span>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Housekeeping */}
-      <Card title="Today's Housekeeping" link="/hotel/housekeeping">
-        {hkTasks.length === 0 && !loading ? (
-          <p className="text-center text-[13px] text-neutral-400 py-4">No tasks scheduled today</p>
-        ) : (
-          <div className="grid gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
-            {hkTasks.slice(0,6).map(t => {
-              const s = HK_BADGE[t.status] ?? { cls: '', icon: null }
-              return (
-                <div key={t.id} className="flex items-center gap-3 rounded-xl border border-neutral-100 px-3.5 py-2.5 dark:border-white/[0.05]">
-                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-sky-100 dark:bg-sky-500/15 text-[12px] font-black text-sky-700 dark:text-sky-400">
-                    {t.room_number}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <p className="text-[12.5px] font-semibold text-neutral-800 dark:text-neutral-200 capitalize">{t.task_type.replace(/_/g,' ')}</p>
-                    <p className="text-[11px] text-neutral-400">{t.assigned_to_name ?? 'Unassigned'}</p>
-                  </div>
-                  <div className={`flex items-center gap-1 text-[12px] font-medium ${s.cls}`}>
-                    {s.icon}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        )}
-      </Card>
-    </div>
-  )
-}
-
-// ─── Tab: Hotel ───────────────────────────────────────────────────────────────
-
-function HotelTab({ stats, occupancy, bookings, hkTasks, loading }: {
-  stats: DashStats | null; occupancy: OccupancyRow[]; bookings: BookingRow[]; hkTasks: HKRow[]; loading: boolean
-}) {
-  const pieData = occupancy.map(r => ({
-    name: r.status.charAt(0).toUpperCase() + r.status.slice(1),
-    value: Number(r.count),
-    color: STATUS_COLOR_PIE[r.status] ?? '#94a3b8',
-  }))
-
-  return (
-    <div className="space-y-6">
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard loading={loading} label="Hotel Revenue Today" value={`$${stats?.today_revenue ?? 0}`}
-          sub="Room charges + extras" change={12.5} icon={Banknote} color="indigo"/>
-        <StatCard loading={loading} label="Active Bookings"     value={String(stats?.active_bookings ?? 0)}
-          sub="Confirmed + checked in" change={8.3} icon={BedDouble} color="sky"/>
-        <StatCard loading={loading} label="Occupancy Rate"      value={`${stats?.occupancy_pct ?? 0}%`}
-          sub={`${stats?.occupied_rooms ?? 0} of ${stats?.total_rooms ?? 0} rooms`} change={3.4} icon={Gauge} color="emerald"/>
-        <StatCard loading={loading} label="Avg Stay Duration"   value="2.4 nts"
-          sub="Per guest" change={-1.2} icon={Hourglass} color="amber"/>
-      </div>
-
-      <div className="grid grid-cols-1 gap-5 xl:grid-cols-3">
-        <div className="col-span-1 xl:col-span-2 rounded-2xl border border-neutral-200/60 bg-white p-5 shadow-sm dark:border-white/[0.06] dark:bg-[#1c2333]">
-          <h3 className="mb-1 text-[14px] font-bold text-neutral-800 dark:text-white">Room Availability</h3>
-          <p className="mb-5 text-[12px] text-neutral-400">Current status breakdown</p>
-          {pieData.length > 0 ? (
-            <div className="h-[220px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={pieData} margin={{ top: 4, right: 4, left: -20, bottom: 0 }} barSize={32}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-neutral-100 dark:text-white/[0.05]" vertical={false}/>
-                  <XAxis dataKey="name" tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false}/>
-                  <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false}/>
-                  <Tooltip/>
-                  <Bar dataKey="value" name="Rooms" radius={[6,6,0,0]}>
-                    {pieData.map((e, i) => <Cell key={i} fill={e.color}/>)}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          ) : (
-            <div className="flex h-[220px] items-center justify-center text-neutral-400">Loading room data…</div>
-          )}
-        </div>
-
-        <div className="rounded-2xl border border-neutral-200/60 bg-white p-5 shadow-sm dark:border-white/[0.06] dark:bg-[#1c2333]">
-          <h3 className="mb-4 text-[14px] font-bold text-neutral-800 dark:text-white">Room Status</h3>
-          {pieData.length > 0 ? (
-            <>
-              <div className="h-[150px]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie data={pieData} cx="50%" cy="50%" innerRadius={44} outerRadius={66} paddingAngle={3} dataKey="value">
-                      {pieData.map((e, i) => <Cell key={i} fill={e.color} stroke="transparent"/>)}
-                    </Pie>
-                    <Tooltip formatter={(v, n) => [`${v} rooms`, n]} contentStyle={{ borderRadius: 10, fontSize: 12 }}/>
-                  </PieChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="mt-3 space-y-1.5">
-                {pieData.map(r => (
-                  <div key={r.name} className="flex items-center justify-between text-[12px]">
-                    <div className="flex items-center gap-2">
-                      <span className="h-2 w-2 rounded-full" style={{ background: r.color }}/>
-                      <span className="text-neutral-600 dark:text-neutral-300">{r.name}</span>
-                    </div>
-                    <span className="font-bold text-neutral-800 dark:text-white">{r.value}</span>
-                  </div>
-                ))}
-              </div>
-            </>
-          ) : null}
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">
-        <Card title="Recent Bookings" link="/hotel/bookings">
-          {loading ? (
-            <div className="space-y-2">{[...Array(4)].map((_,i)=><div key={i} className="h-8 animate-pulse rounded-lg bg-neutral-100 dark:bg-white/[0.05]"/>)}</div>
-          ) : bookings.length === 0 ? (
-            <p className="text-center py-6 text-[13px] text-neutral-400">No bookings yet</p>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-[12.5px]">
-                <thead>
-                  <tr className="border-b border-neutral-100 dark:border-white/[0.05]">
-                    {['Ref','Guest','Room','Check-in','Status'].map(h=>(
-                      <th key={h} className="pb-3 pr-3 text-left font-semibold text-neutral-400 whitespace-nowrap">{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-neutral-50 dark:divide-white/[0.03]">
-                  {bookings.slice(0,6).map(b=>(
-                    <tr key={b.id} className="hover:bg-neutral-50/60 dark:hover:bg-white/[0.02]">
-                      <td className="py-2.5 pr-3 font-mono font-bold text-indigo-600 dark:text-indigo-400 whitespace-nowrap">{b.reference_number}</td>
-                      <td className="py-2.5 pr-3 font-medium text-neutral-800 dark:text-neutral-200 whitespace-nowrap">{b.guest_name ?? '—'}</td>
-                      <td className="py-2.5 pr-3 text-neutral-500 whitespace-nowrap">{b.room_number ?? '—'}</td>
-                      <td className="py-2.5 pr-3 text-neutral-500 whitespace-nowrap">{b.check_in_date?.slice(0,10)}</td>
-                      <td className="py-2.5">
-                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold capitalize ${BOOKING_BADGE[b.status]??''}`}>
-                          {b.status.replace('_',' ')}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </Card>
-
-        <Card title="Housekeeping Tasks" link="/hotel/housekeeping">
-          <div className="space-y-2.5">
-            {hkTasks.slice(0,6).map(t => {
-              const s = HK_BADGE[t.status] ?? { cls: '', icon: null }
-              return (
-                <div key={t.id} className="flex items-center gap-3 rounded-xl border border-neutral-100 px-3.5 py-2.5 dark:border-white/[0.05]">
-                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-sky-100 dark:bg-sky-500/15 text-[12px] font-black text-sky-700 dark:text-sky-400">
-                    {t.room_number}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <p className="text-[12.5px] font-semibold text-neutral-800 dark:text-neutral-200 capitalize">{t.task_type.replace(/_/g,' ')}</p>
-                    <p className="text-[11px] text-neutral-400">{t.assigned_to_name ?? 'Unassigned'}</p>
-                  </div>
-                  <div className={`flex items-center gap-1 text-[12px] font-medium capitalize ${s.cls}`}>
-                    {s.icon}
-                    <span className="hidden sm:inline">{t.status.replace('_',' ')}</span>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </Card>
-      </div>
-    </div>
-  )
-}
-
-// ─── Tab: Restaurant ──────────────────────────────────────────────────────────
-
-function RestaurantTab({ stats, orders, loading }: {
-  stats: DashStats | null; orders: OrderRow[]; loading: boolean
-}) {
-  const openOrders    = orders.filter(o => ['open','preparing','ready'].includes(o.status)).length
-  const servedOrders  = orders.filter(o => o.status === 'served').length
-
-  return (
-    <div className="space-y-6">
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard loading={loading} label="Restaurant Revenue" value={`$${stats?.order_revenue ?? 0}`}
-          sub="Today's food & beverage" change={-2.1} icon={Banknote} color="amber"/>
-        <StatCard loading={loading} label="Orders Today"       value={String(stats?.order_count ?? 0)}
-          sub={`${openOrders} active · ${servedOrders} served`} change={5.2} icon={Receipt} color="indigo"/>
-        <StatCard loading={loading} label="Active Tables"      value={String(openOrders)}
-          sub="Tables with open orders" change={0} icon={Table2} color="sky"/>
-        <StatCard loading={loading} label="Top Item Today"     value="—"
-          sub="Check menu analytics" change={14.3} icon={ChefHat} color="emerald"/>
-      </div>
-
-      <Card title="Active Orders" link="/restaurant/orders">
-        {loading ? (
-          <div className="space-y-3">{[...Array(4)].map((_,i)=><div key={i} className="h-14 animate-pulse rounded-xl bg-neutral-100 dark:bg-white/[0.05]"/>)}</div>
-        ) : orders.length === 0 ? (
-          <p className="text-center py-6 text-[13px] text-neutral-400">No orders today</p>
-        ) : (
-          <div className="space-y-3">
-            {orders.slice(0,8).map(o=>(
-              <div key={o.id} className="flex items-center gap-3 rounded-xl border border-neutral-100 p-3 hover:bg-amber-50/30 dark:border-white/[0.05] dark:hover:bg-amber-500/[0.04] transition-colors">
-                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-100 dark:bg-amber-500/15">
-                  <UtensilsCrossed size={14} className="text-amber-600 dark:text-amber-400"/>
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-baseline justify-between gap-2">
-                    <p className="text-[12.5px] font-bold text-neutral-800 dark:text-neutral-200">{o.order_number}</p>
-                    <p className="text-[12.5px] font-bold text-neutral-800 dark:text-white">${Number(o.total_amount).toFixed(2)}</p>
-                  </div>
-                  <div className="mt-0.5 flex items-center justify-between">
-                    <p className="text-[11.5px] text-neutral-400">{new Date(o.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</p>
-                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold capitalize ${ORDER_BADGE[o.status]??''}`}>{o.status}</span>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
     </div>
   )
 }
@@ -559,125 +181,358 @@ function RestaurantTab({ stats, orders, loading }: {
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 type TabKey = 'overview' | 'hotel' | 'restaurant'
-
-const TABS: { key: TabKey; label: string; icon: React.ReactNode; activeColor: string }[] = [
-  { key: 'overview',   label: 'Overview',   icon: <TrendingUp size={15}/>,      activeColor: 'text-indigo-600 dark:text-indigo-400'  },
-  { key: 'hotel',      label: 'Hotel',      icon: <Hotel size={15}/>,           activeColor: 'text-sky-600 dark:text-sky-400'        },
-  { key: 'restaurant', label: 'Restaurant', icon: <UtensilsCrossed size={15}/>, activeColor: 'text-amber-600 dark:text-amber-400'    },
+const TABS: { key: TabKey; label: string; icon: React.ElementType }[] = [
+  { key: 'overview',   label: 'Overview',   icon: Activity },
+  { key: 'hotel',      label: 'Hotel',      icon: Hotel },
+  { key: 'restaurant', label: 'Restaurant', icon: UtensilsCrossed },
 ]
 
 export default function Dashboard() {
-  const [tab, setTab] = useState<TabKey>('overview')
   const { user } = useAuthContext()
   const branchType = user?.current_branch?.branch_type ?? 'both'
   const role = user?.current_branch?.role ?? user?.role
-  // Same rule the sidebar already uses (components/Layout.tsx) — a
-  // housekeeper or waiter gets their own hotel-only / restaurant-only
-  // dashboard instead of the combined "both" overview, even on a branch
-  // that runs both. Roles with no ops access at all (accountant,
-  // inventory_manager, report_viewer…) fall back to seeing both rather than
-  // an empty dashboard, since there's no dedicated Finance/Inventory tab here.
-  const roleHasAnyOps = !role || roleHasModule(role, 'hotel') || roleHasModule(role, 'restaurant')
+  // Same visibility rule as the sidebar: a housekeeper / waiter gets a hotel-only / restaurant-only view.
+  const roleHasAnyOps   = !role || roleHasModule(role, 'hotel') || roleHasModule(role, 'restaurant')
   const canSeeHotel      = branchType !== 'restaurant' && (!roleHasAnyOps || !role || roleHasModule(role, 'hotel'))
   const canSeeRestaurant = branchType !== 'hotel'      && (!roleHasAnyOps || !role || roleHasModule(role, 'restaurant'))
 
-  const [stats,    setStats]    = useState<DashStats | null>(null)
-  const [occupancy,setOccupancy]= useState<OccupancyRow[]>([])
-  const [bookings, setBookings] = useState<BookingRow[]>([])
-  const [orders,   setOrders]   = useState<OrderRow[]>([])
-  const [hkTasks,  setHKTasks]  = useState<HKRow[]>([])
-  const [loading,  setLoading]  = useState(true)
+  const [tab, setTab] = useState<TabKey>('overview')
+  const [data, setData] = useState<Summary | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [detail, setDetail] = useState<{ kind: string; title: string } | null>(null)
 
-  useEffect(() => {
-    if (!canSeeHotel && tab !== 'restaurant') setTab('restaurant')
-    if (!canSeeRestaurant && tab !== 'hotel') setTab('hotel')
-  }, [canSeeHotel, canSeeRestaurant, tab])
-
-  useEffect(() => {
-    let alive = true
-    const today = new Date().toISOString().slice(0,10)
-    setLoading(true)
-    Promise.all([
-      api.get('/dashboard/stats'),
-      canSeeHotel ? api.get('/dashboard/occupancy') : Promise.resolve({ data: { data: [] } }),
-      canSeeHotel ? api.get('/hotel/bookings') : Promise.resolve({ data: { data: [] } }),
-      canSeeRestaurant ? api.get('/restaurant/orders') : Promise.resolve({ data: { data: [] } }),
-      canSeeHotel ? api.get(`/hotel/housekeeping?date=${today}`) : Promise.resolve({ data: { data: [] } }),
-    ]).then(([s, o, b, ord, hk]) => {
-      if (!alive) return
-      setStats(s.data.data)
-      setOccupancy(o.data.data)
-      setBookings(b.data.data)
-      setOrders(ord.data.data)
-      setHKTasks(hk.data.data)
-    }).catch(console.error)
-     .finally(() => { if (alive) setLoading(false) })
-    return () => { alive = false }
-  }, [canSeeHotel, canSeeRestaurant])
-
-  const today = new Date().toLocaleDateString('en-US', {
-    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-  })
-  const greeting = greetingInfo()
   const visibleTabs = TABS.filter(t =>
-    t.key === 'overview' ? canSeeHotel && canSeeRestaurant :
-    t.key === 'hotel' ? canSeeHotel : canSeeRestaurant
-  )
+    t.key === 'overview' ? canSeeHotel && canSeeRestaurant : t.key === 'hotel' ? canSeeHotel : canSeeRestaurant)
 
-  const initials = user?.full_name
-    ?.split(' ').slice(0,2).map(n => n[0]).join('').toUpperCase() ?? '?'
+  useEffect(() => {
+    if (!visibleTabs.some(t => t.key === tab)) setTab(visibleTabs[0]?.key ?? 'overview')
+  }, [visibleTabs, tab])
+
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
+    try {
+      const r = await api.get('/dashboard/summary')
+      setData(r.data.data); setError('')
+    } catch (e) { if (!silent) setError(getApiErrorMessage(e)) }
+    finally { setLoading(false) }
+  }, [])
+
+  useEffect(() => {
+    load()
+    const timer = setInterval(() => load(true), 60_000)   // quiet refresh — no flicker
+    return () => clearInterval(timer)
+  }, [load])
+
+  const open = (kind: string, title: string) => setDetail({ kind, title })
+
+  // One-page branded summary of today (company logo / banner on top)
+  const [printing, setPrinting] = useState(false)
+  const printSummary = async () => {
+    if (!data || printing) return
+    setPrinting(true)
+    try {
+      const org = await api.get('/system/organization').then(r => r.data.data).catch(() => null)
+      const x = data
+      const pct = (v: number | null) => (v == null ? '' : ` (${v >= 0 ? '+' : ''}${v}% vs yesterday)`)
+      const sections: { heading: string; rows: [string, string][] }[] = []
+      sections.push({ heading: 'Money collected today', rows: [
+        ['Total' + pct(x.collected.delta), money(x.collected.today)],
+        ['Restaurant', money(x.collected.restaurant)], ['Hotel', money(x.collected.hotel)], ['Other', money(x.collected.other)],
+      ] })
+      if (canSeeHotel) sections.push({ heading: 'Hotel', rows: [
+        ['Room revenue tonight' + pct(x.room_revenue.delta), money(x.room_revenue.today)],
+        ['Occupancy', `${x.rooms.occupancy_pct}% (${x.rooms.occupied} of ${x.rooms.total} rooms)`],
+        ['In-house guests', String(x.rooms.in_house)], ['Arrivals today', String(x.rooms.arrivals)], ['Departures today', String(x.rooms.departures)],
+        ['Housekeeping open / done', `${x.housekeeping.open} / ${x.housekeeping.done}`],
+      ] })
+      if (canSeeRestaurant) sections.push({ heading: 'Restaurant', rows: [
+        ['Sales today' + pct(x.restaurant.sales_delta), money(x.restaurant.sales_today)],
+        ['Orders today' + pct(x.restaurant.orders_delta), String(x.restaurant.orders_today)],
+        ['Orders in progress', String(x.restaurant.live_orders)], ['Average ticket', money(x.restaurant.avg_ticket)],
+      ] })
+      if (canSeeRestaurant && x.top_items.length) sections.push({ heading: 'Best sellers today',
+        rows: x.top_items.map(i => [i.name, `${i.qty} sold · ${money(i.revenue)}`] as [string, string]) })
+      sections.push({ heading: 'Needs attention', rows: [
+        ['Unpaid invoices', `${money(x.outstanding.due)} (${x.outstanding.count})`], ['Low stock items', String(x.low_stock)],
+      ] })
+      printSections(org, 'Daily Summary', `${dateLine} · ${user?.current_branch?.branch_name ?? ''}`.replace(/ · $/, ''),
+        user?.full_name ?? user?.email ?? 'User', sections)
+    } finally { setPrinting(false) }
+  }
+
+  const g = greeting()
+  const now = new Date()
+  const dateLine = `${['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][now.getDay()]}, ${now.getDate()} ${['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'][now.getMonth()]} ${now.getFullYear()}`
+  const first = (user?.full_name ?? 'there').split(' ')[0]
+
+  const d = data
+  const series = useMemo(() => (d?.series ?? []).map(s => ({
+    ...s, label: shortDay(s.date),
+    hotel: tab === 'restaurant' ? 0 : s.hotel,
+    restaurant: tab === 'hotel' ? 0 : s.restaurant,
+    other: tab === 'overview' ? s.other : 0,
+  })), [d, tab])
+  const rooms = (d?.rooms.by_status ?? []).map(r => ({
+    name: r.status.replace(/_/g, ' '), key: r.status, value: r.count, color: ROOM_COLOR[r.status] ?? '#c3c9d4',
+  }))
+  const maxQty = Math.max(1, ...(d?.top_items ?? []).map(i => i.qty))
+
+  // ── KPI sets per tab ───────────────────────────────────────────────────────
+  const kCollected = <KpiCard key="c" tone="mint" icon={CircleDollarSign} label="Collected Today" loading={loading}
+    value={money(d?.collected.today ?? 0)} delta={d?.collected.delta}
+    sub={`Restaurant ${money(d?.collected.restaurant ?? 0)} · Hotel ${money(d?.collected.hotel ?? 0)}`}
+    onClick={() => open('revenue', 'Collected today')} />
+  const kRoomRev = <KpiCard key="r" tone="sky" icon={BedDouble} label="Room Revenue Tonight" loading={loading}
+    value={money(d?.room_revenue.today ?? 0)} delta={d?.room_revenue.delta}
+    sub={`${d?.rooms.in_house ?? 0} guests in-house`} onClick={() => open('room_revenue', 'Room revenue today')} />
+  const kSales = <KpiCard key="s" tone="peach" icon={ChefHat} label="Restaurant Sales" loading={loading}
+    value={money(d?.restaurant.sales_today ?? 0)} delta={d?.restaurant.sales_delta}
+    sub={`${d?.restaurant.orders_today ?? 0} orders today`} onClick={() => open('sales', 'Restaurant orders today')} />
+  const kOcc = <KpiCard key="o" tone="lilac" icon={Gauge} label="Occupancy" loading={loading}
+    value={`${d?.rooms.occupancy_pct ?? 0}%`} sub={`${d?.rooms.occupied ?? 0} of ${d?.rooms.total ?? 0} rooms occupied`}
+    onClick={() => open('occupancy', 'Rooms right now')} />
+  const kArr = <KpiCard key="a" tone="butter" icon={LogIn} label="Arrivals Today" loading={loading}
+    value={String(d?.rooms.arrivals ?? 0)} sub="Guests due to check in" onClick={() => open('arrivals', 'Arrivals today')} />
+  const kDep = <KpiCard key="d" tone="rose" icon={LogOut} label="Departures Today" loading={loading}
+    value={String(d?.rooms.departures ?? 0)} sub="Guests due to check out" onClick={() => open('departures', 'Departures today')} />
+  const kOrders = <KpiCard key="n" tone="sky" icon={Receipt} label="Orders Today" loading={loading}
+    value={String(d?.restaurant.orders_today ?? 0)} delta={d?.restaurant.orders_delta}
+    sub="vs yesterday" onClick={() => open('sales', 'Restaurant orders today')} />
+  const kLive = <KpiCard key="l" tone="butter" icon={Soup} label="Orders In Progress" loading={loading}
+    value={String(d?.restaurant.live_orders ?? 0)} sub="Not billed yet" onClick={() => open('orders_open', 'Orders in progress')} />
+  const kTicket = <KpiCard key="t" tone="lilac" icon={TrendingUp} label="Average Ticket" loading={loading}
+    value={money(d?.restaurant.avg_ticket ?? 0)} sub="Per invoice today" onClick={() => open('sales', 'Restaurant orders today')} />
+
+  const kpis = tab === 'hotel'      ? [kRoomRev, kOcc, kArr, kDep]
+             : tab === 'restaurant' ? [kSales, kOrders, kLive, kTicket]
+             :                        [kCollected, kRoomRev, kSales, kOcc]
+
+  const glance = [
+    ...(tab !== 'restaurant' ? [
+      <Glance key="inh" tone="sky"    icon={KeyRound}      label="In-house guests"  value={d?.rooms.in_house ?? 0}        onClick={() => open('occupancy', 'Rooms right now')} />,
+      <Glance key="hk"  tone="butter" icon={SprayCan}      label="Housekeeping open" value={d?.housekeeping.open ?? 0}    onClick={() => open('housekeeping', "Today's housekeeping")} />,
+    ] : []),
+    ...(tab === 'overview' ? [
+      <Glance key="arr" tone="mint"   icon={LogIn}         label="Arrivals"          value={d?.rooms.arrivals ?? 0}       onClick={() => open('arrivals', 'Arrivals today')} />,
+      <Glance key="dep" tone="rose"   icon={LogOut}        label="Departures"        value={d?.rooms.departures ?? 0}     onClick={() => open('departures', 'Departures today')} />,
+    ] : []),
+    ...(tab !== 'hotel' ? [
+      <Glance key="liv" tone="peach"  icon={ConciergeBell} label="Orders in progress" value={d?.restaurant.live_orders ?? 0} onClick={() => open('orders_open', 'Orders in progress')} />,
+    ] : []),
+    <Glance key="out" tone="lilac" icon={FileText}      label="Unpaid invoices" value={money(d?.outstanding.due ?? 0)} onClick={() => open('outstanding', 'Unpaid invoices')} />,
+    <Glance key="low" tone="rose"  icon={PackageSearch} label="Low stock items" value={d?.low_stock ?? 0}              onClick={() => open('stock', 'Low stock')} />,
+  ]
 
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-start justify-between gap-4">
+      <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h1 className="text-[22px] font-extrabold leading-tight text-neutral-900 dark:text-white">
-            {greeting.title}, {firstName(user?.full_name)} 👋
+          <p className="text-[12px] font-semibold uppercase tracking-[0.14em] text-neutral-400">{dateLine}</p>
+          <h1 className="mt-1.5 flex items-center gap-3 text-[28px] font-bold leading-tight tracking-tight text-neutral-900 dark:text-white">
+            <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[#fdf5d8] text-[#7d5f08] dark:bg-[#2b2819] dark:text-[#f2d479]"><g.Icon size={22} /></span>
+            {g.text}, {first}
           </h1>
-          <p className="mt-1 text-[13px] text-neutral-500 dark:text-neutral-400">{today} · {greeting.message}</p>
+          <p className="mt-1 text-[13px] text-neutral-500 dark:text-neutral-400">
+            {user?.current_branch?.branch_name ?? user?.organization_name ?? 'Your property'} · here is how today is going.
+          </p>
         </div>
-        <div className="hidden sm:flex items-center gap-3">
-          <div className="flex items-center gap-2 rounded-xl border border-neutral-200/60 bg-white px-3 py-2 shadow-sm dark:border-white/[0.06] dark:bg-[#1c2333]">
-            <CalendarDays size={14} className="text-indigo-500"/>
-            <span className="text-[13px] font-semibold text-neutral-700 dark:text-neutral-300">Today's Overview</span>
+
+        <div className="flex items-center gap-2.5">
+          {visibleTabs.length > 1 && (
+            <div className="flex rounded-2xl border border-neutral-200/70 bg-white p-1 shadow-sm dark:border-white/[0.06] dark:bg-[#1a2030]">
+              {visibleTabs.map(t => (
+                <button key={t.key} onClick={() => setTab(t.key)}
+                  className={`flex items-center gap-2 rounded-xl px-3.5 py-2 text-[13px] font-semibold transition ${
+                    tab === t.key ? 'bg-[#e8e0fa] text-[#46338a] dark:bg-[#2c2749] dark:text-[#ddd3f8]' : 'text-neutral-500 hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-white'}`}>
+                  <t.icon size={15} />{t.label}
+                </button>
+              ))}
+            </div>
+          )}
+          <button onClick={printSummary} disabled={!d || printing} title="Print today's summary"
+            className="flex h-[42px] items-center gap-2 rounded-2xl border border-neutral-200/70 bg-white px-3.5 text-[12.5px] font-semibold text-neutral-600 shadow-sm transition hover:text-indigo-600 disabled:opacity-40 dark:border-white/[0.06] dark:bg-[#1a2030] dark:text-neutral-300">
+            <Printer size={14} /><span className="hidden sm:inline">Print</span>
+          </button>
+          <button onClick={() => load()} title={d ? `Updated ${timeOf(d.generated_at)}` : 'Refresh'}
+            className="flex h-[42px] items-center gap-2 rounded-2xl border border-neutral-200/70 bg-white px-3.5 text-[12.5px] font-semibold text-neutral-600 shadow-sm transition hover:text-indigo-600 dark:border-white/[0.06] dark:bg-[#1a2030] dark:text-neutral-300">
+            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
+            <span className="hidden sm:inline">{d ? `Updated ${timeOf(d.generated_at)}` : 'Refresh'}</span>
+          </button>
+        </div>
+      </div>
+
+      {error && <p className="rounded-2xl bg-[#fbdde3] px-4 py-3 text-[13px] text-[#a13350] dark:bg-[#40232b] dark:text-[#f3a1b3]">{error}</p>}
+
+      {/* KPI cards — every one opens its details */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">{kpis}</div>
+
+      {/* At a glance */}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4 2xl:grid-cols-7">{glance}</div>
+
+      {/* Revenue + rooms */}
+      <div className="grid grid-cols-1 gap-5 xl:grid-cols-3">
+        <Panel className="xl:col-span-2" title="Money Collected" subtitle="Payments received over the last 7 days"
+          action={<TextBtn onClick={() => open('revenue', 'Collected today')}>Today's payments</TextBtn>}>
+          <div className="mb-2 flex flex-wrap gap-4 text-[12px] text-neutral-500 dark:text-neutral-400">
+            {tab !== 'restaurant' && <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-full" style={{ background: CHART.hotel }} />Hotel</span>}
+            {tab !== 'hotel' && <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-full" style={{ background: CHART.restaurant }} />Restaurant</span>}
+            {tab === 'overview' && <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-full" style={{ background: CHART.other }} />Other</span>}
           </div>
-          <div className="flex items-center gap-2.5 rounded-xl border border-neutral-200/60 bg-white px-3 py-2 shadow-sm dark:border-white/[0.06] dark:bg-[#1c2333]">
-            {user?.organization_logo ? (
-              <img src={user.organization_logo} alt="" className="h-6 w-6 rounded-lg object-cover ring-1 ring-neutral-200 dark:ring-white/10"/>
-            ) : (
-              <div className="flex h-6 w-6 items-center justify-center rounded-lg bg-indigo-600 text-[10px] font-black text-white">
-                {initials}
+          <div className="h-[250px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={series} margin={{ top: 6, right: 4, left: -14, bottom: 0 }} barCategoryGap="28%">
+                <CartesianGrid strokeDasharray="3 6" vertical={false} stroke="currentColor" className="text-neutral-200/80 dark:text-white/[0.06]" />
+                <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#9aa3b2' }} axisLine={false} tickLine={false} />
+                <YAxis tick={{ fontSize: 11, fill: '#9aa3b2' }} axisLine={false} tickLine={false} tickFormatter={v => `$${v}`} />
+                <Tooltip content={<ChartTip />} cursor={{ fill: 'rgba(150,160,190,0.10)', radius: 10 }} />
+                <Bar dataKey="hotel"      stackId="a" fill={CHART.hotel} />
+                <Bar dataKey="restaurant" stackId="a" fill={CHART.restaurant} />
+                <Bar dataKey="other"      stackId="a" fill={CHART.other} radius={[8, 8, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </Panel>
+
+        {tab !== 'restaurant' ? (
+          <Panel title="Rooms" subtitle="Live status" action={<TextBtn onClick={() => open('occupancy', 'Rooms right now')}>All rooms</TextBtn>}>
+            {rooms.length === 0 ? <Empty icon={DoorOpen} text="No rooms set up yet" /> : (
+              <>
+                <div className="relative h-[170px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie data={rooms} dataKey="value" innerRadius={54} outerRadius={78} paddingAngle={3} cornerRadius={6} stroke="none">
+                        {rooms.map(r => <Cell key={r.key} fill={r.color} />)}
+                      </Pie>
+                    </PieChart>
+                  </ResponsiveContainer>
+                  <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
+                    <span className="text-[26px] font-bold leading-none tabular-nums text-neutral-900 dark:text-white">{d?.rooms.occupancy_pct ?? 0}%</span>
+                    <span className="mt-1 text-[11px] text-neutral-400">occupied</span>
+                  </div>
+                </div>
+                <div className="mt-3 space-y-1.5">
+                  {rooms.map(r => (
+                    <button key={r.key} onClick={() => open('occupancy', 'Rooms right now')}
+                      className="flex w-full items-center justify-between rounded-xl px-2.5 py-1.5 text-[12.5px] transition hover:bg-neutral-50 dark:hover:bg-white/[0.04]">
+                      <span className="flex items-center gap-2 capitalize text-neutral-600 dark:text-neutral-300">
+                        <span className="h-2.5 w-2.5 rounded-full" style={{ background: r.color }} />{r.name}
+                      </span>
+                      <span className="font-semibold tabular-nums text-neutral-900 dark:text-white">{r.value}</span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </Panel>
+        ) : (
+          <Panel title="Best Sellers Today" subtitle="Most ordered dishes" action={<TextBtn onClick={() => open('sales', 'Restaurant orders today')}>Orders</TextBtn>}>
+            {(d?.top_items.length ?? 0) === 0 ? <Empty icon={ChefHat} text="No dishes sold yet today" /> : (
+              <div className="space-y-3.5">
+                {d!.top_items.map((it, i) => (
+                  <div key={it.name}>
+                    <div className="flex items-center justify-between text-[12.5px]">
+                      <span className="flex items-center gap-2 font-medium text-neutral-800 dark:text-neutral-100">
+                        <span className={`flex h-5 w-5 items-center justify-center rounded-md text-[10.5px] font-bold ${TONES.peach.soft}`}>{i + 1}</span>{it.name}
+                      </span>
+                      <span className="tabular-nums text-neutral-500">{it.qty} · {money(it.revenue)}</span>
+                    </div>
+                    <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-neutral-100 dark:bg-white/[0.06]">
+                      <div className="h-full rounded-full" style={{ width: `${(it.qty / maxQty) * 100}%`, background: CHART.restaurant }} />
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
-            <div className="leading-none">
-              <p className="text-[12px] font-bold text-neutral-800 dark:text-neutral-100">{user?.full_name ?? 'User'}</p>
-              <p className="mt-0.5 text-[10px] capitalize text-neutral-400">{user?.current_branch?.role?.replace(/_/g,' ') ?? 'Admin'}</p>
-            </div>
-            <UserCircle2 size={14} className="text-neutral-300 dark:text-neutral-600"/>
-          </div>
-        </div>
+          </Panel>
+        )}
       </div>
 
-      {/* Tab bar */}
-      <div className="flex items-center gap-1 rounded-xl border border-neutral-200/60 bg-white p-1 shadow-sm dark:border-white/[0.06] dark:bg-[#1c2333] w-fit">
-        {visibleTabs.map(t => (
-          <button key={t.key} onClick={() => setTab(t.key)}
-            className={`flex items-center gap-2 rounded-lg px-4 py-2 text-[13px] font-semibold transition-all ${
-              tab === t.key
-                ? 'bg-neutral-100 dark:bg-white/[0.08] ' + t.activeColor
-                : 'text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300'
-            }`}
-          >
-            <span className={tab === t.key ? t.activeColor : 'text-neutral-400'}>{t.icon}</span>
-            {t.label}
-          </button>
-        ))}
+      {/* Recent activity */}
+      <div className="grid grid-cols-1 gap-5 xl:grid-cols-5">
+        {tab !== 'restaurant' && (
+          <Panel className={tab === 'hotel' ? 'xl:col-span-3' : 'xl:col-span-3'} title="Recent Bookings" subtitle="Newest reservations"
+            action={<LinkBtn to="/hotel/bookings">View all</LinkBtn>}>
+            {(d?.recent_bookings.length ?? 0) === 0 ? <Empty icon={BedDouble} text="No bookings yet" /> : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-[12.5px]">
+                  <thead>
+                    <tr className="text-left text-[10.5px] font-semibold uppercase tracking-wide text-neutral-400">
+                      <th className="pb-2.5 pr-3">Guest</th><th className="pb-2.5 pr-3">Room</th><th className="pb-2.5 pr-3">Stay</th>
+                      <th className="pb-2.5 pr-3">Status</th><th className="pb-2.5 text-right">Total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {d!.recent_bookings.map(b => (
+                      <tr key={b.id} className="border-t border-neutral-100 transition hover:bg-neutral-50/80 dark:border-white/[0.05] dark:hover:bg-white/[0.03]">
+                        <td className="py-3 pr-3">
+                          <a href={`/hotel/bookings/${b.id}/statement`} target="_blank" rel="noreferrer" title="Open guest statement"
+                            className="font-semibold text-neutral-800 hover:text-indigo-600 dark:text-neutral-100">{b.guest_name}</a>
+                          <p className="font-mono text-[10.5px] text-neutral-400">{b.booking_ref}</p>
+                        </td>
+                        <td className="py-3 pr-3"><span className={`rounded-lg px-2 py-1 text-[11.5px] font-bold ${TONES.sky.soft}`}>{b.room_number}</span></td>
+                        <td className="whitespace-nowrap py-3 pr-3 text-neutral-500">{shortDate(b.check_in_date)} → {shortDate(b.check_out_date)}</td>
+                        <td className="py-3 pr-3"><StatusPill status={b.status} /></td>
+                        <td className="py-3 text-right font-semibold tabular-nums text-neutral-800 dark:text-neutral-100">{money(Number(b.total_amount))}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Panel>
+        )}
+
+        {tab !== 'hotel' && (
+          <Panel className={tab === 'restaurant' ? 'xl:col-span-5' : 'xl:col-span-2'} title="Latest Orders" subtitle="Newest restaurant orders"
+            action={<LinkBtn to="/restaurant/operations">View all</LinkBtn>}>
+            {(d?.recent_orders.length ?? 0) === 0 ? <Empty icon={UtensilsCrossed} text="No orders yet" /> : (
+              <div className="space-y-2.5">
+                {d!.recent_orders.map(o => (
+                  <button key={o.id} onClick={() => open('sales', 'Restaurant orders today')}
+                    className="flex w-full items-center gap-3 rounded-2xl border border-neutral-100 p-3 text-left transition hover:bg-neutral-50 dark:border-white/[0.05] dark:hover:bg-white/[0.04]">
+                    <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${TONES.peach.chip}`}><UtensilsCrossed size={16} /></span>
+                    <span className="min-w-0 flex-1">
+                      <span className="flex items-baseline justify-between gap-2">
+                        <span className="text-[13px] font-semibold text-neutral-800 dark:text-neutral-100">{o.order_ref}{o.table_number ? ` · Table ${o.table_number}` : ''}</span>
+                        <span className="text-[13px] font-bold tabular-nums text-neutral-900 dark:text-white">{money(Number(o.total_amount))}</span>
+                      </span>
+                      <span className="mt-1 flex items-center justify-between">
+                        <span className="flex items-center gap-1 text-[11.5px] text-neutral-400"><Clock size={11} />{timeOf(o.opened_at)}</span>
+                        <StatusPill status={o.status} />
+                      </span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </Panel>
+        )}
+
+        {tab === 'hotel' && (
+          <Panel className="xl:col-span-2" title="Housekeeping" subtitle={`${d?.housekeeping.done ?? 0} done · ${d?.housekeeping.open ?? 0} open`}
+            action={<TextBtn onClick={() => open('housekeeping', "Today's housekeeping")}>Details</TextBtn>}>
+            {(d?.housekeeping.tasks.length ?? 0) === 0 ? <Empty icon={SprayCan} text="No cleaning scheduled today" /> : (
+              <div className="space-y-2.5">
+                {d!.housekeeping.tasks.map(t => (
+                  <div key={t.id} className="flex items-center gap-3 rounded-2xl border border-neutral-100 px-3 py-2.5 dark:border-white/[0.05]">
+                    <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-[12.5px] font-bold ${TONES.butter.chip}`}>{t.room_number}</span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-[13px] font-semibold capitalize text-neutral-800 dark:text-neutral-100">{t.task_type.replace(/_/g, ' ')}</span>
+                      <span className="block text-[11.5px] text-neutral-400">{t.assigned_to_name ?? 'Unassigned'}</span>
+                    </span>
+                    <StatusPill status={t.status} />
+                  </div>
+                ))}
+              </div>
+            )}
+          </Panel>
+        )}
       </div>
 
-      {tab === 'overview'   && canSeeHotel && canSeeRestaurant && <OverviewTab    stats={stats} occupancy={occupancy} bookings={bookings} orders={orders} hkTasks={hkTasks} loading={loading}/>}
-      {tab === 'hotel'      && canSeeHotel && <HotelTab       stats={stats} occupancy={occupancy} bookings={bookings} hkTasks={hkTasks} loading={loading}/>}
-      {tab === 'restaurant' && canSeeRestaurant && <RestaurantTab  stats={stats} orders={orders} loading={loading}/>}
+      <DetailModal open={!!detail} onClose={() => setDetail(null)}
+        url={detail ? `/dashboard/detail/${detail.kind}` : null} title={detail?.title ?? ''} />
     </div>
   )
 }

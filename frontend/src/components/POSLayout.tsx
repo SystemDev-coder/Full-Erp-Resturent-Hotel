@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Outlet, Link, useNavigate } from 'react-router-dom'
+import { Outlet, useNavigate } from 'react-router-dom'
 import { ChefHat, Clock, ArrowLeft, UserCircle2, Sun, Moon } from 'lucide-react'
 import { useTheme } from '@/contexts/ThemeContext'
 import { useAuthContext } from '@/contexts/AuthContext'
@@ -50,7 +50,7 @@ export default function POSLayout() {
         <div className="flex-1"/>
 
         {/* Theme toggle */}
-        <button onClick={toggleTheme}
+        <button onClick={(e) => toggleTheme({ x: e.clientX, y: e.clientY })}
           className="flex h-8 w-8 items-center justify-center rounded-xl border border-neutral-200/60 text-neutral-500 hover:border-neutral-300 hover:bg-neutral-50 dark:border-white/[0.08] dark:text-neutral-400 dark:hover:bg-white/[0.06] transition-colors">
           {theme === 'dark' ? <Sun size={14}/> : <Moon size={14}/>}
         </button>
@@ -68,6 +68,7 @@ export default function POSLayout() {
 
         {/* Exit POS */}
         <button onClick={() => navigate('/dashboard')}
+          title="Exit POS — the POS locks and each waiter's open order is saved until they unlock again"
           className="flex items-center gap-1.5 rounded-xl border border-neutral-200/60 bg-white px-3 py-2 text-[12px] font-semibold text-neutral-600 hover:border-rose-300 hover:bg-rose-50 hover:text-rose-600 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-neutral-400 dark:hover:border-rose-500/30 dark:hover:bg-rose-500/10 dark:hover:text-rose-400 transition-colors">
           <ArrowLeft size={13}/> <span className="hidden sm:inline">Exit POS</span>
         </button>
@@ -77,6 +78,15 @@ export default function POSLayout() {
       <div className="flex-1 overflow-hidden">
         <Outlet/>
       </div>
+
+      {/* ── Footer ── */}
+      <footer className="flex shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-0.5 border-t border-neutral-200/70 bg-white px-4 py-1.5 text-[11px] text-neutral-500 dark:border-white/[0.06] dark:bg-[#0b0c10] dark:text-neutral-400">
+        <span>© {new Date().getFullYear()} {user?.organization_name ?? 'Hospitality ERP'}. All rights reserved.</span>
+        <span>
+          Prepared by{' '}
+          <a href="https://madalict.com" target="_blank" rel="noreferrer" className="font-medium text-sky-600 hover:underline dark:text-sky-400">Madal ICT — madalict.com</a>
+        </span>
+      </footer>
     </div>
   )
 }

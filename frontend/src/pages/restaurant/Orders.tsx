@@ -1,14 +1,18 @@
-import { useState } from 'react'
-import { Plus, UtensilsCrossed, LayoutGrid, Table2, RefreshCw } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Plus, UtensilsCrossed, LayoutGrid, Table2, RefreshCw, Printer, Eye } from 'lucide-react'
+import { OrderViewModal } from '@/components/restaurant/OrderViewModal'
+import { printBillFor } from '@utils/billSlip'
 import { DataTable, type DTColumn } from '@/components/ui/DataTable'
 import { LoadMoreBar } from '@/components/ui/LoadMoreBar'
 import api from '@/services/api'
 import { getApiErrorMessage } from '@/services/api'
 import { useLoadMore } from '@hooks/useLoadMore'
+import { withApproval, isApprovalCancelled } from '@utils/approval'
+import { printReadySlipFor } from '@utils/readySlip'
 
 // Mirrors what GET /restaurant/orders actually returns
 interface Order {
-  id: string; order_ref: string; order_type: string; status: string
+  id: string; order_ref: string; call_no?: number | null; order_type: string; status: string
   table_number: string | null; waiter_name: string | null
   total_amount: string; item_count: string; opened_at: string
 }
@@ -39,13 +43,21 @@ export default function Orders() {
   const [acting,       setActing]       = useState<string | null>(null)
 
   const [billed, setBilled] = useState('')
+  const [viewId, setViewId] = useState<string | null>(null)
+
+  // keep statuses live (kitchen marks things ready, waiters serve) without pressing refresh
+  useEffect(() => {
+    const t = setInterval(() => { if (!document.hidden && !acting) load() }, 10_000)
+    return () => clearInterval(t)
+  }, [load, acting])
 
   const doAction = async (id: string, action: 'close' | 'cancel') => {
     setActing(id)
     try {
-      await api.patch(`/restaurant/orders/${id}/${action}`)
+      // Cancelling an order that has items asks for a reason + manager approval (the server decides)
+      await withApproval(body => api.patch(`/restaurant/orders/${id}/${action}`, body))
       load()
-    } catch (e) { setError(getApiErrorMessage(e)) }
+    } catch (e) { if (!isApprovalCancelled(e)) setError(getApiErrorMessage(e)) }
     finally { setActing(null) }
   }
 
@@ -64,11 +76,13 @@ export default function Orders() {
   const doBill = async (id: string) => {
     setActing(id)
     try {
-      const r = await api.post(`/restaurant/orders/${id}/bill`)
-      setBilled(`Invoice ${r.data.data.invoice_number} created (unpaid) — collect via Finance → Receipts`)
-      setTimeout(() => setBilled(''), 5000)
+      const r = await withApproval(body => api.post(`/restaurant/orders/${id}/bill`, body))
+      // the customer's bill comes out of the thermal printer straight away
+      printBillFor(id).catch(e => setError(getApiErrorMessage(e)))
+      setBilled(`Bill ${r.data.data.invoice_number} printed — the customer pays at the cashier`)
+      setTimeout(() => setBilled(''), 6000)
       load()
-    } catch (e) { setError(getApiErrorMessage(e)) }
+    } catch (e) { if (!isApprovalCancelled(e)) setError(getApiErrorMessage(e)) }
     finally { setActing(null) }
   }
 
@@ -89,7 +103,7 @@ export default function Orders() {
   const filtered = orders.filter(o => statusFilter === 'all' || o.status === statusFilter)
 
   const COLS: DTColumn<Order>[] = [
-    { key:'order_ref',    label:'Order #',  render:r=><span className="font-mono font-bold text-indigo-600 dark:text-indigo-400">{r.order_ref}</span> },
+    { key:'order_ref',    label:'Order #',  render:r=><span className="font-mono font-bold text-indigo-600 dark:text-indigo-400">{r.call_no ? <b className="mr-1.5 rounded bg-emerald-100 px-1.5 py-0.5 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300">#{r.call_no}</b> : null}{r.order_ref}</span> },
     { key:'opened_at',    label:'Time',     render:r=><span className="text-neutral-500 dark:text-neutral-400">{fmt(r.opened_at)}</span> },
     { key:'table_number', label:'Table',    render:r=><span className="font-semibold text-neutral-700 dark:text-neutral-300">{r.table_number ?? '—'}</span> },
     { key:'order_type',   label:'Type',     render:r=><span className={`rounded-full px-2 py-0.5 text-[10.5px] font-bold capitalize ${TYPE_BADGE[r.order_type]??''}`}>{r.order_type.replace('_',' ')}</span> },
@@ -99,9 +113,9 @@ export default function Orders() {
     { key:'status',       label:'Status',   render:r=><span className={`rounded-full px-2.5 py-0.5 text-[11px] font-bold capitalize ${STATUS_BADGE[r.status]??''}`}>{r.status.replace('_',' ')}</span> },
     { key:'_actions', label:'', sortable:false, render:r=>{
       const next = nextAction(r)
-      if (!next && !['open','preparing','ready','served'].includes(r.status)) return null
       return (
         <div className="flex gap-1.5">
+          <button onClick={()=>setViewId(r.id)} title="View this order" className="rounded-lg bg-neutral-100 px-2 py-1 text-neutral-500 hover:bg-neutral-200 dark:bg-white/[0.06] dark:text-neutral-300"><Eye size={12}/></button>
           {next && (
             <button onClick={next.run} disabled={acting===r.id}
               className={`rounded-lg px-2.5 py-1 text-[11px] font-bold transition-colors disabled:opacity-50 ${next.cls}`}>
@@ -170,13 +184,17 @@ export default function Orders() {
           {filtered.length === 0
             ? <div className="col-span-full py-12 text-center text-neutral-400">No orders match this filter.</div>
             : filtered.map(o=>(
-              <div key={o.id} className="rounded-2xl border border-neutral-200/60 bg-white p-4 shadow-sm hover:shadow-md transition-shadow dark:border-white/[0.06] dark:bg-[#1c2333]">
+              <div key={o.id} className={`rounded-2xl border bg-white p-4 shadow-sm transition-shadow hover:shadow-md dark:bg-[#1c2333] ${o.status === 'ready' ? 'border-emerald-300 ring-2 ring-emerald-200 dark:border-emerald-500/40 dark:ring-emerald-500/20' : 'border-neutral-200/60 dark:border-white/[0.06]'}`}>
                 <div className="flex items-start justify-between mb-3">
                   <div>
-                    <p className="text-[13.5px] font-bold text-neutral-800 dark:text-white">{o.order_ref}</p>
+                    <p className="text-[13.5px] font-bold text-neutral-800 dark:text-white">{o.call_no ? <span className="mr-1.5 rounded-md bg-emerald-100 px-1.5 py-0.5 text-[12px] text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300">#{o.call_no}</span> : null}{o.order_ref}</p>
                     <p className="text-[11px] text-neutral-400 mt-0.5">{fmt(o.opened_at)} · {o.waiter_name ?? 'No server'}</p>
                   </div>
-                  <span className={`rounded-full px-2.5 py-0.5 text-[10.5px] font-bold capitalize ${STATUS_BADGE[o.status]??''}`}>{o.status.replace('_',' ')}</span>
+                  <div className="flex items-center gap-1.5">
+                    <button onClick={()=>setViewId(o.id)} title="View this order" className="rounded-lg bg-neutral-100 p-1.5 text-neutral-500 hover:bg-neutral-200 dark:bg-white/[0.06] dark:text-neutral-300"><Eye size={12}/></button>
+                    {o.status === 'ready' && <button onClick={() => printReadySlipFor(o.id).catch(e => setError(getApiErrorMessage(e)))} title="Print the ready slip (call number)" className="rounded-lg bg-emerald-50 p-1.5 text-emerald-600 hover:bg-emerald-100 dark:bg-emerald-500/10"><Printer size={12}/></button>}
+                    <span className={`rounded-full px-2.5 py-0.5 text-[10.5px] font-bold capitalize ${STATUS_BADGE[o.status]??''}`}>{o.status === 'ready' ? 'READY — serve' : o.status.replace('_',' ')}</span>
+                  </div>
                 </div>
                 <div className="flex items-center gap-2 mb-3">
                   <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-100 dark:bg-amber-500/15">
@@ -212,6 +230,7 @@ export default function Orders() {
         <LoadMoreBar hasMore={hasMore} loading={loading} loadingMore={loadingMore} onLoadMore={loadMore} count={orders.length}/>
         </>
       )}
+      {viewId && <OrderViewModal orderId={viewId} onClose={() => setViewId(null)} />}
     </div>
   )
 }

@@ -2,13 +2,18 @@ import { useState, useEffect, useCallback } from 'react'
 import {
   RefreshCw, TrendingUp, TrendingDown, Scale, FileText,
   BedDouble, UtensilsCrossed, Boxes, Wallet, Landmark, PieChart,
-  ArrowDownToLine, ArrowUpFromLine, AlertTriangle, Printer,
+  ArrowDownToLine, ArrowUpFromLine, AlertTriangle, Printer, ArrowUpRight, LayoutDashboard, ShieldCheck,
 } from 'lucide-react'
 import { DataTable, type DTColumn } from '@/components/ui/DataTable'
 import { DatePicker } from '@/components/ui/DatePicker'
+import { DetailModal } from '@/components/ui/DetailModal'
+import { money } from '@utils/detailFormat'
 import api from '@/services/api'
 import { getApiErrorMessage } from '@/services/api'
 import { useAuth } from '@hooks/useAuth'
+import { Tabs } from '@/components/ui/Tabs'
+import FinanceReport from './reports/FinanceReport'
+import SystemReport from './reports/SystemReport'
 import { printHtml, esc, companyHeader, printStamp, type OrgInfo } from '@utils/print'
 
 // ─── Types (shape of /accounting/reports/summary) ─────────────────────────────
@@ -45,13 +50,18 @@ const PRESETS = [
   { key: '90d',   label: 'Last 90 days',  days: 89 },
 ]
 
-const fmt = (n: number | string) =>
-  '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const fmt = (n: number | string) => money(n)
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function Reports() {
   const { user } = useAuth()
+  // Report tabs: General for everyone; Finance for money roles; System (security & usage) for administrators.
+  const role = user?.current_branch?.role ?? user?.role
+  const canFinance = !!role && ['org_admin', 'branch_manager', 'accountant', 'hotel_cashier', 'report_viewer'].includes(role)
+  const canSystem  = !!role && ['org_admin', 'branch_manager'].includes(role)
+  const [tab, setTab] = useState<'general' | 'finance' | 'system'>('general')
+  const [refreshKey, setRefreshKey] = useState(0)
   const [from, setFrom] = useState(() => iso(new Date(Date.now() - 29 * 86_400_000)))
   const [to,   setTo]   = useState(() => iso(new Date()))
 
@@ -59,6 +69,8 @@ export default function Reports() {
   const [org,     setOrg]     = useState<OrgInfo | null>(null)
   const [loading, setLoading] = useState(true)
   const [error,   setError]   = useState('')
+  // Which card's details are open (the rows behind a KPI number)
+  const [detail, setDetail] = useState<{ kind: string; title: string } | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -79,7 +91,7 @@ export default function Reports() {
   const printReport = () => {
     if (!data) return
     const printedBy = user?.full_name ?? user?.email ?? 'User'
-    const money = (n: number | string) => '$' + Number(n).toFixed(2)
+    const money = (n: number | string) => (Number(n) < 0 ? '-$' : '$') + Math.abs(Number(n)).toFixed(2)
     const row2 = (label: string, value: string, bold = false) =>
       `<tr${bold ? ' class="bold"' : ''}><td>${esc(label)}</td><td class="right">${value}</td></tr>`
 
@@ -92,7 +104,7 @@ export default function Reports() {
     ).join('')
 
     printHtml(`
-      ${companyHeader(org)}
+      ${companyHeader(org, 'a4')}
       <hr/>
       <div class="center bold lg">MANAGEMENT REPORT</div>
       <div class="center sm">${esc(data.period.from)} → ${esc(data.period.to)}</div>
@@ -149,7 +161,7 @@ export default function Reports() {
       </table>
       <hr/>
       <div class="center xs mt">Printed by ${esc(printedBy)} · ${printStamp()}</div>
-    `, 190) // A4-width report
+    `, 190, { a4: true }) // A4 document
 
     api.post('/system/audit/print', {
       action: 'PRINT_REPORT',
@@ -203,36 +215,41 @@ export default function Reports() {
 
   // ── Small building blocks ───────────────────────────────────────────────────
 
-  const KPI = ({ icon, label, value, sub, color }: {
-    icon: React.ReactNode; label: string; value: string; sub?: string; color: string
+  const KPI = ({ icon, label, value, sub, color, kind }: {
+    icon: React.ReactNode; label: string; value: string; sub?: string; color: string; kind: string
   }) => (
-    <div className="rounded-2xl border border-neutral-200/60 bg-white p-5 shadow-sm dark:border-white/[0.06] dark:bg-[#1c2333]">
-      <div className="flex items-center gap-3">
-        <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${color}`}>{icon}</span>
-        <div className="min-w-0">
-          <p className="text-[10.5px] font-semibold uppercase tracking-wide text-neutral-400">{label}</p>
-          <p className="truncate text-[20px] font-extrabold leading-tight text-neutral-900 dark:text-white">{value}</p>
-          {sub && <p className="text-[11px] text-neutral-400">{sub}</p>}
-        </div>
+    <button type="button" onClick={() => setDetail({ kind, title: label })}
+      className="group w-full rounded-3xl border border-neutral-200/70 bg-white p-5 text-left shadow-sm transition duration-200 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/[0.06] focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300 dark:border-white/[0.06] dark:bg-[#1a2030]">
+      <div className="flex items-start justify-between">
+        <span className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl ${color}`}>{icon}</span>
+        <ArrowUpRight size={16} className="text-neutral-300 opacity-0 transition group-hover:opacity-100 dark:text-neutral-500" />
       </div>
-    </div>
+      <p className="mt-4 text-[12px] font-semibold text-neutral-500 dark:text-neutral-400">{label}</p>
+      <p className="mt-0.5 truncate text-[26px] font-bold leading-tight tracking-tight tabular-nums text-neutral-900 dark:text-white">{value}</p>
+      {sub && <p className="mt-0.5 text-[11.5px] text-neutral-400">{sub}</p>}
+    </button>
   )
 
-  const Stat = ({ label, value, accent }: { label: string; value: string; accent?: string }) => (
-    <div className="flex items-center justify-between py-1.5">
+  const Stat = ({ label, value, accent, kind }: { label: string; value: string; accent?: string; kind?: string }) => (
+    <div className={`flex items-center justify-between py-1.5 ${kind ? 'cursor-pointer rounded-lg px-1.5 -mx-1.5 hover:bg-neutral-50 dark:hover:bg-white/[0.04]' : ''}`}
+      onClick={kind ? () => setDetail({ kind, title: label }) : undefined}>
       <span className="text-[12.5px] text-neutral-500 dark:text-neutral-400">{label}</span>
-      <span className={`text-[13px] font-extrabold ${accent ?? 'text-neutral-800 dark:text-white'}`}>{value}</span>
+      <span className={`text-[13px] font-extrabold tabular-nums ${accent ?? 'text-neutral-800 dark:text-white'}`}>{value}</span>
     </div>
   )
 
-  const Section = ({ icon, title, color, children }: {
-    icon: React.ReactNode; title: string; color: string; children: React.ReactNode
+  const Section = ({ icon, title, color, children, kind }: {
+    icon: React.ReactNode; title: string; color: string; children: React.ReactNode; kind: string
   }) => (
-    <div className="rounded-2xl border border-neutral-200/60 bg-white p-5 shadow-sm dark:border-white/[0.06] dark:bg-[#1c2333]">
-      <div className="mb-3 flex items-center gap-2.5">
-        <span className={`flex h-8 w-8 items-center justify-center rounded-lg ${color}`}>{icon}</span>
-        <h3 className="text-[14px] font-extrabold text-neutral-900 dark:text-white">{title}</h3>
-      </div>
+    <div className="rounded-3xl border border-neutral-200/70 bg-white p-5 shadow-sm transition duration-200 hover:shadow-md dark:border-white/[0.06] dark:bg-[#1a2030]">
+      <button type="button" onClick={() => setDetail({ kind, title })}
+        className="group mb-3 flex w-full items-center gap-2.5 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300 rounded-xl">
+        <span className={`flex h-9 w-9 items-center justify-center rounded-xl ${color}`}>{icon}</span>
+        <h3 className="flex-1 text-[14.5px] font-bold tracking-tight text-neutral-900 dark:text-white">{title}</h3>
+        <span className="flex items-center gap-1 text-[11.5px] font-semibold text-indigo-600 opacity-70 transition group-hover:opacity-100 dark:text-indigo-300">
+          Details <ArrowUpRight size={12} />
+        </span>
+      </button>
       <div className="divide-y divide-neutral-100 dark:divide-white/[0.05]">{children}</div>
     </div>
   )
@@ -257,35 +274,44 @@ export default function Reports() {
           <div className="w-36"><DatePicker value={from} onChange={setFrom}/></div>
           <span className="text-neutral-400">→</span>
           <div className="w-36"><DatePicker value={to} onChange={setTo}/></div>
-          <button onClick={load}
+          <button onClick={() => { load(); setRefreshKey(k => k + 1) }}
             className="flex h-9 w-9 items-center justify-center rounded-xl border border-neutral-200 bg-white text-neutral-500 hover:border-indigo-300 hover:text-indigo-600 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-neutral-400 transition-colors">
             <RefreshCw size={15} className={loading ? 'animate-spin' : ''}/>
           </button>
-          <button onClick={printReport} disabled={!data}
+          <button onClick={printReport} disabled={!data} style={{ display: tab === 'general' ? undefined : 'none' }}
             className="flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2 text-[13px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-40 transition-colors">
             <Printer size={14}/> Print Report
           </button>
         </div>
       </div>
 
-      {error && <p className="rounded-xl bg-rose-50 px-4 py-2.5 text-[13px] text-rose-700 dark:bg-rose-500/10 dark:text-rose-300">{error}</p>}
+      <Tabs active={tab} onChange={k => setTab(k as typeof tab)} tabs={[
+        { key: 'general', label: 'General', icon: <LayoutDashboard size={14}/> },
+        ...(canFinance ? [{ key: 'finance', label: 'Finance', icon: <Wallet size={14}/> }] : []),
+        ...(canSystem  ? [{ key: 'system',  label: 'System',  icon: <ShieldCheck size={14}/> }] : []),
+      ]}/>
 
-      {data && (
+      {tab === 'finance' && canFinance && <FinanceReport from={from} to={to} refreshKey={refreshKey}/>}
+      {tab === 'system'  && canSystem  && <SystemReport  from={from} to={to} refreshKey={refreshKey}/>}
+
+      {tab === 'general' && error && <p className="rounded-xl bg-rose-50 px-4 py-2.5 text-[13px] text-rose-700 dark:bg-rose-500/10 dark:text-rose-300">{error}</p>}
+
+      {tab === 'general' && data && (
         <>
           {/* ── KPI row ─────────────────────────────────────────────────── */}
           <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">
-            <KPI icon={<TrendingUp size={17}/>} label="Money In" value={fmt(data.money.total_in)}
-              color="bg-emerald-100 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-400"/>
-            <KPI icon={<TrendingDown size={17}/>} label="Money Out" value={fmt(data.money.total_out)}
-              color="bg-rose-100 text-rose-600 dark:bg-rose-500/15 dark:text-rose-400"/>
-            <KPI icon={<Scale size={17}/>} label="Net" value={fmt(data.money.net)}
+            <KPI kind="money_in" icon={<TrendingUp size={20}/>} label="Money In" value={fmt(data.money.total_in)}
+              color="bg-[#c9ecd9] text-[#1d6b48] dark:bg-[#25433a] dark:text-[#8fe0b8]"/>
+            <KPI kind="money_out" icon={<TrendingDown size={20}/>} label="Money Out" value={fmt(data.money.total_out)}
+              color="bg-[#f7c9d3] text-[#a13350] dark:bg-[#4d2f38] dark:text-[#f3a1b3]"/>
+            <KPI kind="net" icon={<Scale size={20}/>} label="Net" value={fmt(data.money.net)}
               sub={data.money.net >= 0 ? 'Profit for period' : 'Loss for period'}
               color={data.money.net >= 0
-                ? 'bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-400'
-                : 'bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-400'}/>
-            <KPI icon={<FileText size={17}/>} label="Outstanding" value={fmt(data.receivables.outstanding)}
+                ? 'bg-[#c8e0fa] text-[#25588f] dark:bg-[#243d5c] dark:text-[#9cc8f5]'
+                : 'bg-[#f7e5a6] text-[#7d5f08] dark:bg-[#4a421c] dark:text-[#f2d479]'}/>
+            <KPI kind="outstanding" icon={<FileText size={20}/>} label="Outstanding" value={fmt(data.receivables.outstanding)}
               sub="Unpaid guest invoices"
-              color="bg-violet-100 text-violet-600 dark:bg-violet-500/15 dark:text-violet-400"/>
+              color="bg-[#d9cff5] text-[#5a43a6] dark:bg-[#352f5c] dark:text-[#c4b5f5]"/>
           </div>
 
           {/* ── Daily cash-flow chart ───────────────────────────────────── */}
@@ -319,8 +345,8 @@ export default function Reports() {
 
           {/* ── Module sections ─────────────────────────────────────────── */}
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-            <Section icon={<BedDouble size={15}/>} title="Hotel"
-              color="bg-sky-100 text-sky-600 dark:bg-sky-500/15 dark:text-sky-400">
+            <Section kind="hotel" icon={<BedDouble size={17}/>} title="Hotel"
+              color="bg-[#c8e0fa] text-[#25588f] dark:bg-[#243d5c] dark:text-[#9cc8f5]">
               <Stat label="Bookings" value={data.hotel.bookings.total}/>
               <Stat label="Checked in / out" value={`${data.hotel.bookings.checked_in} / ${data.hotel.bookings.checked_out}`}/>
               <Stat label="Cancelled" value={data.hotel.bookings.cancelled} accent="text-rose-600 dark:text-rose-400"/>
@@ -328,42 +354,42 @@ export default function Reports() {
               <Stat label="Occupancy today" value={`${occupancy}% (${data.hotel.rooms.occupied}/${data.hotel.rooms.total_rooms})`}/>
             </Section>
 
-            <Section icon={<UtensilsCrossed size={15}/>} title="Restaurant"
-              color="bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-400">
+            <Section kind="restaurant" icon={<UtensilsCrossed size={17}/>} title="Restaurant"
+              color="bg-[#fad5b8] text-[#9a4b1c] dark:bg-[#4a3526] dark:text-[#f7b98a]">
               <Stat label="Orders" value={data.restaurant.total_orders}/>
               <Stat label="Cancelled" value={data.restaurant.cancelled} accent="text-rose-600 dark:text-rose-400"/>
               <Stat label="Order revenue" value={fmt(data.restaurant.order_revenue)} accent="text-emerald-600 dark:text-emerald-400"/>
             </Section>
 
-            <Section icon={<Boxes size={15}/>} title="Inventory"
-              color="bg-emerald-100 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-400">
+            <Section kind="inventory" icon={<Boxes size={17}/>} title="Inventory"
+              color="bg-[#c9ecd9] text-[#1d6b48] dark:bg-[#25433a] dark:text-[#8fe0b8]">
               <Stat label="Items tracked" value={data.inventory.item_count}/>
               <Stat label="Stock value" value={fmt(data.inventory.stock_value)}/>
               <Stat label="Low stock items" value={String(data.inventory.low_stock)}
                 accent={data.inventory.low_stock > 0 ? 'text-rose-600 dark:text-rose-400' : undefined}/>
             </Section>
 
-            <Section icon={<FileText size={15}/>} title="Receivables (Guests)"
-              color="bg-violet-100 text-violet-600 dark:bg-violet-500/15 dark:text-violet-400">
+            <Section kind="receivables" icon={<FileText size={17}/>} title="Receivables (Guests)"
+              color="bg-[#d9cff5] text-[#5a43a6] dark:bg-[#352f5c] dark:text-[#c4b5f5]">
               <Stat label="Invoices" value={data.receivables.count}/>
               <Stat label="Invoiced" value={fmt(data.receivables.invoiced)}/>
               <Stat label="Collected" value={fmt(data.receivables.collected)} accent="text-emerald-600 dark:text-emerald-400"/>
               <Stat label="Outstanding" value={fmt(data.receivables.outstanding)} accent="text-amber-600 dark:text-amber-400"/>
             </Section>
 
-            <Section icon={<Landmark size={15}/>} title="Payables (Suppliers)"
-              color="bg-rose-100 text-rose-600 dark:bg-rose-500/15 dark:text-rose-400">
+            <Section kind="payables" icon={<Landmark size={17}/>} title="Payables (Suppliers)"
+              color="bg-[#f7c9d3] text-[#a13350] dark:bg-[#4d2f38] dark:text-[#f3a1b3]">
               <Stat label="Bills" value={data.payables.count}/>
               <Stat label="Billed" value={fmt(data.payables.billed)}/>
               <Stat label="Paid" value={fmt(data.payables.paid)} accent="text-emerald-600 dark:text-emerald-400"/>
               <Stat label="Payable" value={fmt(data.payables.payable)} accent="text-amber-600 dark:text-amber-400"/>
             </Section>
 
-            <Section icon={<Wallet size={15}/>} title="Payroll, Expenses & Assets"
-              color="bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-400">
+            <Section kind="payroll" icon={<Wallet size={17}/>} title="Payroll, Expenses & Assets"
+              color="bg-[#f7e5a6] text-[#7d5f08] dark:bg-[#4a421c] dark:text-[#f2d479]">
               <Stat label="Salaries paid" value={fmt(data.salaries_paid)} accent="text-rose-600 dark:text-rose-400"/>
               <Stat label="Expenses paid" value={fmt(data.expenses_paid)} accent="text-rose-600 dark:text-rose-400"/>
-              <Stat label="Assets" value={`${data.assets.count} (${fmt(data.assets.current_value)})`}/>
+              <Stat kind="assets" label="Assets" value={`${data.assets.count} (${fmt(data.assets.current_value)})`}/>
             </Section>
           </div>
 
@@ -395,6 +421,9 @@ export default function Reports() {
           </div>
         </>
       )}
+
+      <DetailModal open={!!detail} onClose={() => setDetail(null)}
+        url={detail ? `/accounting/reports/detail/${detail.kind}?from=${from}&to=${to}` : null} title={detail?.title ?? ''} />
     </div>
   )
 }
