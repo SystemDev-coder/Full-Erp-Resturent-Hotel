@@ -166,10 +166,6 @@ export default function Login() {
           {loading ? <span className="h-5 w-5 animate-spin rounded-full border-2 border-white/30 border-t-white" /> : 'Login'}
         </button>
         </>)}
-
-        <div className="mt-5 rounded-lg border border-sky-100 bg-sky-50 px-3 py-2 text-[12px] text-sky-800 dark:border-sky-500/15 dark:bg-sky-500/10 dark:text-sky-200">
-          Admin: admin@mogadishugrand.so / Admin@1234
-        </div>
       </motion.div>
     </div>
   )

@@ -1,9 +1,9 @@
 import { safeRouter } from '../utils/safeRouter'
-import { requireAuth, requireModule } from '../middleware/auth'
+import { requireAuth, requireModule, requireRole } from '../middleware/auth'
 import { enforceModulePermission } from '../middleware/permissions'
 import {
   listStaff, getStaff, createStaff, updateStaff,
-  deactivateStaff, activateStaff, deleteStaff,
+  deactivateStaff, activateStaff, deleteStaff, createStaffLogin,
 } from '../controllers/hr/staffController'
 import { setStaffPin } from '../controllers/restaurant/posController'
 import {
@@ -33,6 +33,7 @@ hrRouter.put   ('/staff/:id',            updateStaff)
 hrRouter.patch ('/staff/:id/deactivate', deactivateStaff)
 hrRouter.patch ('/staff/:id/activate',   activateStaff)
 hrRouter.patch ('/staff/:id/pin',        setStaffPin)
+hrRouter.post  ('/staff/:id/create-login', requireRole('org_admin', 'branch_manager'), createStaffLogin)
 hrRouter.delete('/staff/:id',            deleteStaff)
 
 // ── Payroll ───────────────────────────────────────────────────────────────────

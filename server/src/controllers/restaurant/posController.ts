@@ -15,19 +15,24 @@ export async function listPosStaff(req: Request, res: Response) {
   const { rows } = await query(
     `SELECT s.id, s.first_name, s.last_name, s.role, s.employee_id,
             (s.pos_pin IS NOT NULL) AS has_pin,
-            (u.id IS NOT NULL AND (
-               (s.email IS NOT NULL AND lower(s.email) = lower(u.email))
-            OR (length(regexp_replace(COALESCE(s.phone, ''), '\\D', '', 'g')) >= 7
-                AND right(regexp_replace(COALESCE(s.phone, ''), '\\D', '', 'g'), 9) = right(regexp_replace(COALESCE(u.phone, ''), '\\D', '', 'g'), 9))
-            OR lower(trim(s.first_name || ' ' || s.last_name)) = lower(trim(u.full_name))
-            )) AS is_me
+            CASE WHEN u.id IS NULL THEN 0
+                 WHEN s.email IS NOT NULL AND lower(s.email) = lower(u.email) THEN 3
+                 WHEN length(regexp_replace(COALESCE(s.phone, ''), '\\D', '', 'g')) >= 7
+                      AND right(regexp_replace(COALESCE(s.phone, ''), '\\D', '', 'g'), 9) = right(regexp_replace(COALESCE(u.phone, ''), '\\D', '', 'g'), 9) THEN 2
+                 WHEN lower(trim(s.first_name || ' ' || s.last_name)) = lower(trim(u.full_name)) THEN 1
+                 ELSE 0 END AS match_rank
      FROM staff s LEFT JOIN users u ON u.id = $3
      WHERE s.branch_id = $1 AND s.is_active = TRUE AND s.deleted_at IS NULL
        AND s.role = ANY($2)
      ORDER BY s.first_name`,
     [branchId, POS_ROLES, userId]
   )
-  return res.json({ success: true, data: rows })
+  // only the BEST kind of match counts (email > phone > name), and only when it points to exactly one person —
+  // two staff who share a name must never be guessed between
+  const best = Math.max(0, ...rows.map((r: any) => Number(r.match_rank)))
+  const winners = best > 0 ? rows.filter((r: any) => Number(r.match_rank) === best) : []
+  const data = rows.map(({ match_rank, ...r }: any) => ({ ...r, is_me: winners.length === 1 && Number(match_rank) === best }))
+  return res.json({ success: true, data })
 }
 
 // "My sales today" for the POS chip: what this person has collected, and how many orders

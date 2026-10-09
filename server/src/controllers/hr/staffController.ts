@@ -1,5 +1,8 @@
 import { Request, Response } from 'express'
+import bcrypt from 'bcryptjs'
+import { randomInt } from 'crypto'
 import { query } from '../../db/pool'
+import { logAudit } from '../../utils/audit'
 import { getPagination, sliceHasMore } from '../../utils/pagination'
 
 export async function listStaff(req: Request, res: Response) {
@@ -11,7 +14,9 @@ export async function listStaff(req: Request, res: Response) {
   const { rows } = await query(
     `SELECT s.id, s.employee_id, s.first_name, s.last_name, s.email, s.phone,
             s.role, s.employment_type, s.basic_salary, s.joined_at, s.is_active,
-            d.name AS department_name
+            d.name AS department_name,
+            EXISTS (SELECT 1 FROM users u JOIN user_branch ub ON ub.user_id = u.id AND ub.branch_id = s.branch_id AND ub.deleted_at IS NULL
+                    WHERE s.email IS NOT NULL AND lower(u.email) = lower(s.email) AND u.deleted_at IS NULL) AS has_login
      FROM staff s LEFT JOIN department d ON d.id = s.department_id
      WHERE s.branch_id = $1 AND s.deleted_at IS NULL
      ORDER BY s.first_name
@@ -112,3 +117,40 @@ export const activateStaff = (req: Request, res: Response) => setStaffState(req,
 
 export const deleteStaff = (req: Request, res: Response) => setStaffState(req, res,
   `UPDATE staff SET deleted_at = NOW(), is_active = FALSE, updated_at = NOW() WHERE id = $1 AND branch_id = $2 AND deleted_at IS NULL RETURNING id`)
+
+// ── Create a system login for a staff member ─────────────────────────────────
+// HR staff (POS name + PIN) and system users (email + password) are separate lists. This makes the user account
+// for an existing staff member in one step, with the right role, and writes the same email on the staff profile so the
+// POS recognises them ("is_me") and opens straight on their PIN pad.
+const STAFF_TO_USER_ROLE: Record<string, string> = {
+  waiter: 'waiter', cashier: 'cashier', chef: 'chef', bar_staff: 'bar_staff', receptionist: 'receptionist', housekeeper: 'housekeeper',
+  hotel_cashier: 'hotel_cashier', accountant: 'accountant', inventory_manager: 'inventory_manager',
+  manager: 'branch_manager', branch_manager: 'branch_manager',
+}
+
+export async function createStaffLogin(req: Request, res: Response) {
+  const { orgId, branchId, userId } = req.auth!
+  const { rows: [s] } = await query(
+    `SELECT id, first_name, last_name, email, phone, role FROM staff WHERE id = $1 AND branch_id = $2 AND deleted_at IS NULL`, [req.params.id, branchId])
+  if (!s) return res.status(404).json({ success: false, message: 'Staff not found' })
+
+  const email = String(req.body?.email ?? s.email ?? '').trim().toLowerCase()
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ success: false, message: 'Enter a valid email address — it is the username for signing in.' })
+  const password = req.body?.password ? String(req.body.password) : ''
+  if (password && password.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' })
+
+  const { rows: taken } = await query(`SELECT 1 FROM users WHERE lower(email) = $1 AND deleted_at IS NULL`, [email])
+  if (taken[0]) return res.status(409).json({ success: false, message: 'That email already has a login. Use a different email, or edit the existing user in Settings → Users.' })
+
+  const role = STAFF_TO_USER_ROLE[s.role] ?? 'report_viewer'
+  const generated = !password
+  const plain = password || Array.from({ length: 8 }, () => 'abcdefghjkmnpqrstuvwxyz23456789'[randomInt(31)]).join('') + 'A1!'
+  const { rows: [user] } = await query(
+    `INSERT INTO users (organization_id, full_name, email, phone, password_hash, created_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, email, full_name`,
+    [orgId, `${s.first_name} ${s.last_name}`.trim(), email, s.phone ?? null, await bcrypt.hash(plain, 12), userId])
+  await query(`INSERT INTO user_branch (user_id, branch_id, role, is_primary, invited_by) VALUES ($1,$2,$3,TRUE,$4)`, [user.id, branchId, role, userId])
+  if (!s.email || s.email.toLowerCase() !== email) await query(`UPDATE staff SET email = $2, updated_at = NOW() WHERE id = $1`, [s.id, email])
+
+  logAudit({ userId, branchId, action: 'USER_CREATED', tableName: 'users', recordId: user.id, req, newValues: { from_staff: s.id, email, role } })
+  return res.status(201).json({ success: true, data: { ...user, role, temp_password: generated ? plain : undefined, role_note: STAFF_TO_USER_ROLE[s.role] ? undefined : `"${s.role}" has no matching login role, so the account is read-only (report viewer). Change it in Settings → Users.` } })
+}

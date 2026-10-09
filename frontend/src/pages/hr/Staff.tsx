@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Plus, Pencil, RefreshCw, Power, KeyRound, Trash2, Users, Building2, Tag } from 'lucide-react'
+import { Plus, Pencil, RefreshCw, Power, KeyRound, Trash2, Users, Building2, Tag, UserPlus, Copy, CheckCircle2 } from 'lucide-react'
 import { DataTable, type DTColumn } from '@/components/ui/DataTable'
 import Modal, { INPUT, Field, CancelBtn } from '@/components/ui/Modal'
 import ConfirmModal from '@/components/ui/ConfirmModal'
@@ -12,7 +12,7 @@ import { useLoadMore } from '@hooks/useLoadMore'
 
 interface Staff {
   id: string; first_name: string; last_name: string; email: string
-  phone?: string; role: string; employment_type: string
+  phone?: string; role: string; employment_type: string; has_login?: boolean
   base_salary?: number; basic_salary?: number; joined_date?: string; joined_at?: string; is_active: boolean
   department_name?: string
 }
@@ -50,7 +50,7 @@ export default function Staff() {
   const [loading, setLoading] = useState(true)
   const [saving,  setSaving]  = useState(false)
   const [error,   setError]   = useState('')
-  const [mode,    setMode]    = useState<null | 'add' | 'edit' | 'pin' | 'delete' | 'deptAdd' | 'deptEdit' | 'deptDelete' | 'setState'>(null)
+  const [mode,    setMode]    = useState<null | 'add' | 'edit' | 'pin' | 'login' | 'delete' | 'deptAdd' | 'deptEdit' | 'deptDelete' | 'setState'>(null)
   const [selected,setSelected]= useState<Staff | null>(null)
   const [selectedDept, setSelectedDept] = useState<Department | null>(null)
   const [deptName, setDeptName] = useState('')
@@ -147,6 +147,21 @@ export default function Staff() {
     finally { setSaving(false) }
   }
 
+  // Create a sign-in (email + password) for this staff member — the role is taken from their staff role
+  const [loginForm, setLoginForm] = useState({ email: '', password: '' })
+  const [loginResult, setLoginResult] = useState<{ email: string; temp_password?: string; role: string; role_note?: string } | null>(null)
+  const [copied, setCopied] = useState(false)
+  const openLogin = (s: Staff) => { setSelected(s); setLoginForm({ email: s.email ?? '', password: '' }); setLoginResult(null); setMode('login'); setError('') }
+  const saveLogin = async () => {
+    if (!selected) return
+    setSaving(true); setError('')
+    try {
+      const r = await api.post(`/hr/staff/${selected.id}/create-login`, { email: loginForm.email, password: loginForm.password || undefined })
+      setLoginResult(r.data.data); loadAll()
+    } catch (e) { setError(getApiErrorMessage(e)) }
+    finally { setSaving(false) }
+  }
+
   const openPin = (s: Staff) => { setSelected(s); setPin(''); setMode('pin'); setError('') }
 
   const savePin = async () => {
@@ -234,6 +249,12 @@ export default function Staff() {
         <button onClick={()=>openEdit(r)} className="rounded-lg bg-neutral-100 px-2.5 py-1 text-[11px] font-bold text-neutral-600 hover:bg-indigo-100 hover:text-indigo-700 dark:bg-neutral-700 dark:text-neutral-300 transition-colors">
           <Pencil size={11}/>
         </button>
+        {!r.has_login && (
+          <button onClick={()=>openLogin(r)} title="Create a login (email + password) for this person"
+            className="rounded-lg bg-sky-50 px-2.5 py-1 text-[11px] font-bold text-sky-700 hover:bg-sky-100 dark:bg-sky-500/10 dark:text-sky-300 transition-colors">
+            <UserPlus size={11}/>
+          </button>
+        )}
         <button onClick={()=>openPin(r)}
           title="Set POS PIN"
           className="rounded-lg bg-amber-50 px-2.5 py-1 text-[11px] font-bold text-amber-700 hover:bg-amber-100 dark:bg-amber-500/10 dark:text-amber-300 transition-colors">
@@ -464,6 +485,54 @@ export default function Staff() {
             </p>
           </div>
         </div>
+      </Modal>
+
+      {/* Create login */}
+      <Modal open={mode==='login'} onClose={close}
+        title={`Create login — ${selected?.first_name ?? ''} ${selected?.last_name ?? ''}`} size="sm"
+        footer={loginResult ? <button onClick={close} className="rounded-xl bg-emerald-600 px-5 py-2 text-[13px] font-semibold text-white hover:bg-emerald-700">Done</button> : <>
+          <CancelBtn onClick={close}/>
+          <button onClick={saveLogin} disabled={saving || !loginForm.email.trim()}
+            className="flex items-center gap-2 rounded-xl bg-sky-600 px-5 py-2 text-[13px] font-semibold text-white hover:bg-sky-700 disabled:opacity-40 transition-colors">
+            {saving ? <RefreshCw size={13} className="animate-spin"/> : <UserPlus size={13}/>} Create login
+          </button>
+        </>}>
+        {loginResult ? (
+          <div className="space-y-3">
+            <div className="flex items-start gap-3 rounded-2xl bg-emerald-50 p-4 dark:bg-emerald-500/10">
+              <CheckCircle2 size={20} className="mt-0.5 shrink-0 text-emerald-600"/>
+              <div className="text-[13px] text-emerald-800 dark:text-emerald-200">
+                <p className="font-bold">Login created</p>
+                <p>Sign in with <b>{loginResult.email}</b> · role <b className="capitalize">{loginResult.role.replace('_', ' ')}</b></p>
+              </div>
+            </div>
+            {loginResult.temp_password && (
+              <div className="rounded-xl border border-neutral-200 p-3 dark:border-white/[0.08]">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-neutral-400">Temporary password (shown once)</p>
+                <div className="mt-1 flex items-center gap-2">
+                  <code className="flex-1 text-[16px] font-bold tracking-wider text-neutral-900 dark:text-white">{loginResult.temp_password}</code>
+                  <button onClick={async () => { try { await navigator.clipboard.writeText(loginResult.temp_password!); setCopied(true); setTimeout(() => setCopied(false), 2000) } catch { /* blocked */ } }}
+                    className="flex items-center gap-1 rounded-lg bg-neutral-100 px-2.5 py-1.5 text-[11.5px] font-semibold dark:bg-white/10"><Copy size={12}/> {copied ? 'Copied' : 'Copy'}</button>
+                </div>
+                <p className="mt-2 text-[11.5px] text-neutral-500">Give it to {selected?.first_name}. They can change it after signing in.</p>
+              </div>
+            )}
+            {loginResult.role_note && <p className="rounded-xl bg-amber-50 px-3 py-2 text-[12px] text-amber-800 dark:bg-amber-500/10 dark:text-amber-200">{loginResult.role_note}</p>}
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {error && <p className="rounded-xl bg-rose-50 px-4 py-2.5 text-[13px] text-rose-700 dark:bg-rose-500/10 dark:text-rose-300">{error}</p>}
+            <Field label="Email (the username)">
+              <input type="email" className={INPUT} value={loginForm.email} onChange={e=>setLoginForm(p=>({...p, email:e.target.value}))} placeholder="name@example.com" autoFocus/>
+            </Field>
+            <Field label="Password (leave empty to generate one)">
+              <input type="text" className={INPUT} value={loginForm.password} onChange={e=>setLoginForm(p=>({...p, password:e.target.value}))} placeholder="at least 6 characters"/>
+            </Field>
+            <p className="rounded-xl bg-sky-50 p-3 text-[12px] text-sky-800 dark:bg-sky-500/10 dark:text-sky-200">
+              The login gets the role <b className="capitalize">{selected?.role?.replace('_', ' ')}</b>. The POS will then open straight on their own PIN pad when they sign in.
+            </p>
+          </div>
+        )}
       </Modal>
 
       <ConfirmModal
